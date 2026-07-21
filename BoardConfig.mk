@@ -83,8 +83,9 @@ TARGET_USERIMAGES_USE_F2FS := true
 # Treble
 BOARD_VNDK_VERSION := current
 
-# Vendor_boot recovery ramdisk
+# Vendor_boot recovery ramdisk (VAB: dual-entry vendor_boot)
 BOARD_MOVE_RECOVERY_RESOURCES_TO_VENDOR_BOOT := true
+BOARD_INCLUDE_RECOVERY_RAMDISK_IN_VENDOR_BOOT := true
 
 # Verified Boot
 BOARD_AVB_ENABLE := true
