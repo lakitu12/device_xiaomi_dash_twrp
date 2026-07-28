@@ -91,5 +91,5 @@ TW_USE_DMCTL := true
 # Keep user-0 credential entry explicit; hardware throttling governs retries.
 TW_SKIP_FBE_DEFAULT_PASSWORD := true
 
-# RGB565 is the format proven by the v7-v9 runtime tests. Touch and the stock
-# host bridge remain a separately audited recovery overlay.
+# TWRP version suffix shown in About page (e.g. "3.7.1_16-lakitu")
+TW_DEVICE_VERSION := lakitu
