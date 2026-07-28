@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <manifest>
+  <!-- Upstream fork repos (bootable/recovery etc.) -->
   <remote name="yorokobi"
           fetch="https://github.com/YorokobiMaster/" />
+
+  <!-- Our device tree — edit here for local debugging -->
+  <remote name="lakitu12"
+          fetch="https://github.com/lakitu12/" />
 
   <!-- Replace the three upstream platform repos with the dash-modified forks. -->
   <remove-project name="android_bootable_recovery" />
@@ -12,6 +17,6 @@
   <project path="system/core" name="android_system_core" remote="yorokobi" revision="twrp-16.0" />
   <project path="system/vold" name="android_system_vold" remote="yorokobi" revision="twrp-16.0" />
 
-  <project path="device/xiaomi/dash" name="device_xiaomi_dash_twrp" remote="yorokobi" revision="twrp-16.0" />
+  <project path="device/xiaomi/dash" name="device_xiaomi_dash_twrp" remote="lakitu12" revision="twrp-16.0" />
   <project path="repack" name="dash_vendor_boot_repack" remote="yorokobi" revision="main" />
 </manifest>
