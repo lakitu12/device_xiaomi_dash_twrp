@@ -1,9 +1,0 @@
-# Device-specific HAL binary paths not covered by system file_contexts
-/(vendor|system/vendor)/bin/hw/android\.hardware\.automotive\.evs@1\.[0-9]-service  u:object_r:hal_evs_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.automotive\.vehicle@2\.0-(service|protocan-service)  u:object_r:hal_vehicle_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.biometrics\.fingerprint-service\.example u:object_r:hal_fingerprint_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.camera\.provider@2\.[0-9]+-external-service          u:object_r:hal_camera_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.camera\.provider@2\.[0-9]+-service_64       u:object_r:hal_camera_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.camera\.provider@2\.[0-9]+-service-lazy_64  u:object_r:hal_camera_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.camera\.provider@2\.[0-9]+-service-lazy     u:object_r:hal_camera_default_exec:s0
-/(vendor|system/vendor)/bin/hw/android\.hardware\.camera\.provider@2\.[0-9]+-service          u:object_r:hal_camera_default_exec:s0
