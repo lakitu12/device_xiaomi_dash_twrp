@@ -35,4 +35,8 @@ PRODUCT_PACKAGES -= \
     fsck.ntfs \
     vim
 
+# magiskboot prebuilt has 4K page alignment but recovery build expects 16K;
+# suppress the check so the prebuilt binary passes the ELF verifier.
+PRODUCT_CHECK_PREBUILT_MAX_PAGE_SIZE := false
+
 PRODUCT_SOONG_NAMESPACES += $(DEVICE_PATH)
