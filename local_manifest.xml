@@ -11,7 +11,10 @@
   <remove-project name="android_system_vold" />
 
   <!-- Override external/sqlite to add recovery_available on static noicu variant -->
-  <remove-project name="platform/external/sqlite" />
+  <!-- Note: twrp-default.xml already removes platform/external/sqlite and
+       adds android_external_sqlite from TWRP-A16 remote. We override that
+       with our own fork. -->
+  <remove-project name="android_external_sqlite" />
 
   <project path="bootable/recovery" name="android_bootable_recovery" remote="lakitu12" revision="twrp-16.0" />
   <project path="system/core" name="android_system_core" remote="yorokobi" revision="twrp-16.0" />
