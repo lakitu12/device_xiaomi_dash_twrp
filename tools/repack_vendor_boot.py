@@ -1,98 +1,95 @@
 #!/usr/bin/env python3
 """
-TWRP vendor_boot 重打包工具 — for Redmi Turbo 5 Max (dash)
+TWRP vendor_boot 重打包 — 按 README 流程
+支持标准 AOSP vendor_boot（单 ramdisk）和 MTK 双 fragment 格式。
 
-用法:
-    python3 tools/repack_vendor_boot.py \\
-        --stock /path/to/stock_vendor_boot.img \\
-        --ci    /path/to/ci_vendor_boot.img \\
-        [--output /path/to/output.img]
-
-流程:
-  1. 从 stock F0 取 vendor ramdisk → 删 recovery binary + res/
-     → 加 twrp16/（9 个 API36 库，从 CI 提取）
-     → init.rc service recovery 内加 setenv LD_LIBRARY_PATH
-  2. 从 stock F1 取 stock recovery → 取 first_stage_ramdisk、vintf、fastboot 服务
-  3. 从 CI F1 取 TWRP recovery + 独有 lib（不在 F0 中的）+ twres/
-  4. 合并 F1：stock F1 基础设施 + CI TWRP 内容
-  5. 构建 MTK 双 fragment vendor_boot v4 → 64MB 镜像
+  --stock  原厂 vendor_boot.img
+  --ci     CI 构建产物 vendor_boot.img  
 """
 import struct, subprocess, os, shutil, sys, argparse
 
-PARTITION_SIZE = 67108864
 PAGE_SIZE = 4096
 ENTRY_SIZE = 108
+PARTITION_SIZE = 67108864
 HS_OFF = 2096
 DTB_OFF = 2100
 TBL_OFF = 2112
 
-
 def align(v, a):
     return (v + a - 1) // a * a
 
-
 def get_frags(img_path):
-    """解析 MTK vendor_boot v4 结构。"""
-    with open(img_path, 'rb') as f:
-        d = f.read()
-    hs = struct.unpack_from('<I', d, HS_OFF)[0]
-    ds = struct.unpack_from('<I', d, DTB_OFF)[0]
-    rs = struct.unpack_from('<I', d, 24)[0]
-    ec = struct.unpack_from('<I', d, TBL_OFF + 4)[0]
-    es = struct.unpack_from('<I', d, TBL_OFF + 8)[0]
-    ro = align(hs, PAGE_SIZE)
+    """解析 vendor_boot。支持 MTK 双 fragment（表在 header 内）和标准单 ramdisk 格式。"""
+    d = open(img_path, 'rb').read()
+    page0 = d[:PAGE_SIZE]
+    hs = struct.unpack_from('<I', page0, HS_OFF)[0]   # 2128
+    ds = struct.unpack_from('<I', page0, DTB_OFF)[0]  # 535963
+    rs = struct.unpack_from('<I', page0, 24)[0]        # ramdisk_size
+    ro = align(hs, PAGE_SIZE)                           # 4096
     dtbo = align(ro + rs, PAGE_SIZE)
-    tblo = align(dtbo + align(ds, PAGE_SIZE), PAGE_SIZE)
+
+    # 尝试 MTK fragment 表
+    tbl_off = struct.unpack_from('<I', page0, TBL_OFF)[0]
+    ec = struct.unpack_from('<I', page0, TBL_OFF + 4)[0]
+    es = struct.unpack_from('<I', page0, TBL_OFF + 8)[0]
+
     frags = []
+    has_valid_entries = False
     for i in range(ec):
-        eo = tblo + i * es
-        sz = struct.unpack_from('<I', d, eo)[0]
-        off = struct.unpack_from('<I', d, eo + 4)[0]
-        typ = struct.unpack_from('<I', d, eo + 8)[0]
-        name = d[eo + 12:eo + 44].rstrip(b'\x00').decode()
-        payload = d[ro + off:ro + off + sz]
+        eo = tbl_off + i * es
+        sz = struct.unpack_from('<I', page0, eo)[0]
+        off = struct.unpack_from('<I', page0, eo + 4)[0]
+        typ = struct.unpack_from('<I', page0, eo + 8)[0]
+        name = page0[eo + 12:eo + 44].rstrip(b'\x00').decode()
+        if sz > 0:
+            has_valid_entries = True
+            payload = d[ro + off:ro + off + sz]
+        else:
+            payload = b''
         frags.append({'size': sz, 'offset': off, 'type': typ, 'name': name, 'payload': payload})
+
+    # 标准格式（无有效 MTK fragment）：整个 ramdisk 作为 F0
+    if not has_valid_entries and rs > 0:
+        payload = d[ro:ro + rs]
+        frags = [{'size': rs, 'offset': 0, 'type': 1, 'name': '', 'payload': payload}]
+        print(f"  -> standard format, single ramdisk ({len(payload)/1024/1024:.2f} MB)")
+
+    # DTB
     dtb_data = b''
-    for o in range(dtbo, min(dtbo + 8192, len(d))):
+    for o in range(dtbo, min(dtbo + 16384, len(d))):
         if d[o:o + 4] == b'\xd0\x0d\xfe\xed':
             dtb_sz = struct.unpack_from('>I', d, o + 4)[0]
             dtb_data = d[o:o + dtb_sz]
             break
+    if not dtb_data and ds > 0:
+        dtb_data = d[dtbo:dtbo + ds]
+
     return {
-        'frags': frags, 'dtb': dtb_data, 'page0': d[:PAGE_SIZE],
-        'hs': hs, 'ds': ds, 'ro': ro,
+        'frags': frags, 'dtb': dtb_data, 'page0': page0,
+        'hs': hs, 'ds': ds, 'ro': ro, 'rs': rs,
     }
 
-
-def unpack_lz4(data, dest):
-    """解压 LZ4 cpio 到目录。"""
+def unpack_lz4_or_raw(data, dest):
+    """解压（可能未压缩的）cpio 到目录。"""
     if os.path.exists(dest):
         shutil.rmtree(dest)
     os.makedirs(dest)
-    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin'], input=data,
-                       capture_output=True, timeout=30)
-    if r.returncode != 0:
-        return None
-    subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True,
-                   timeout=30, cwd=dest)
-    return r.stdout
-
-
-def pack_cpio(src):
-    """目录 → cpio。"""
-    r = subprocess.run(['find', '.', '-print0'], capture_output=True, timeout=10, cwd=src)
-    p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'],
-                       input=r.stdout, capture_output=True, timeout=60, cwd=src)
-    return p.stdout
-
+    # 先尝试 LZ4 解压
+    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin', '--favor-decSpeed'],
+                       input=data, capture_output=True, timeout=30)
+    if r.returncode == 0 and len(r.stdout) > 0:
+        cpio_data = r.stdout
+    else:
+        # 不是 LZ4，尝试直接作为 cpio
+        cpio_data = data
+    subprocess.run(['cpio', '-idm'], input=cpio_data, capture_output=True, timeout=30, cwd=dest)
+    return cpio_data
 
 def pack_lz4(src, tmp):
-    """目录 → cpio → LZ4 -l -9，返回 LZ4 bytes。"""
-    cpio = pack_cpio(src)
-    subprocess.run(['lz4', '-l', '-9', '--force', '-', tmp],
-                   input=cpio, capture_output=True, timeout=60)
+    r = subprocess.run(['find', '.', '-print0'], capture_output=True, timeout=10, cwd=src)
+    p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'], input=r.stdout, capture_output=True, timeout=60, cwd=src)
+    subprocess.run(['lz4', '-l', '-9', '--force', '-', tmp], input=p.stdout, capture_output=True, timeout=60)
     return open(tmp, 'rb').read()
-
 
 def main():
     ap = argparse.ArgumentParser(description='TWRP vendor_boot repack for dash')
@@ -100,7 +97,6 @@ def main():
     ap.add_argument('--ci', required=True, help='CI 构建产物 vendor_boot.img')
     ap.add_argument('--output', default='/tmp/dash-UNTESTED-vendor_boot.img')
     args = ap.parse_args()
-
     for p in [args.stock, args.ci]:
         if not os.path.exists(p):
             print(f"ERROR: {p} not found", file=sys.stderr)
@@ -110,10 +106,10 @@ def main():
     ci = get_frags(args.ci)
     print(f"Stock: {len(stk['frags'])} frags, CI: {len(ci['frags'])} frags")
 
-    # ---- F0: 改造 stock vendor ramdisk ----
+    # ======== F0：改造 stock vendor ramdisk ========
     print("\n[F0] 改造 stock vendor ramdisk ...")
     f0d = '/tmp/rf0'
-    unpack_lz4(stk['frags'][0]['payload'], f0d)
+    unpack_lz4_or_raw(stk['frags'][0]['payload'], f0d)
 
     # 删 recovery binary + res/
     for p in [f'{f0d}/system/bin/recovery', f'{f0d}/res']:
@@ -123,12 +119,13 @@ def main():
 
     # 加 twrp16/（从 CI F1 提取）
     ci1d = '/tmp/rci1'
-    unpack_lz4(ci['frags'][1]['payload'], ci1d)
-    twrp16 = ['libbase.so', 'libbootloader_message.so', 'libc++.so', 'libcutils.so',
-              'libfs_mgr.so', 'liblog.so', 'liblp.so', 'libprotobuf-cpp-lite.so', 'libutils.so']
+    ci_f1_payload = ci['frags'][1]['payload'] if len(ci['frags']) > 1 else ci['frags'][0]['payload']
+    unpack_lz4_or_raw(ci_f1_payload, ci1d)
+    twrp16_libs = ['libbase.so', 'libbootloader_message.so', 'libc++.so', 'libcutils.so',
+                   'libfs_mgr.so', 'liblog.so', 'liblp.so', 'libprotobuf-cpp-lite.so', 'libutils.so']
     tdir = f'{f0d}/system/lib64/twrp16'
     os.makedirs(tdir, exist_ok=True)
-    for lib in twrp16:
+    for lib in twrp16_libs:
         s = f'{ci1d}/system/lib64/{lib}'
         if os.path.exists(s):
             shutil.copy2(s, f'{tdir}/{lib}', follow_symlinks=False)
@@ -139,9 +136,9 @@ def main():
     if os.path.exists(irc):
         with open(irc) as f:
             c = f.read()
-        tag = 'service recovery /system/bin/recovery\n' \
-              '    socket recovery stream 422 system system\n' \
-              '    seclabel u:r:recovery:s0\n    user root'
+        tag = ('service recovery /system/bin/recovery\n'
+               '    socket recovery stream 422 system system\n'
+               '    seclabel u:r:recovery:s0\n    user root')
         if tag in c:
             c = c.replace(tag, tag + '\n    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64')
             with open(irc, 'w') as f:
@@ -151,198 +148,62 @@ def main():
     f0 = pack_lz4(f0d, '/tmp/rf0.lz4')
     print(f"  F0: {len(f0)/1024/1024:.2f} MB LZ4")
 
-    # ---- F1: CI F1 base + stock 基础设施 ----
-    print("\n[F1] 构建 recovery ramdisk ...")
+    # ======== F1：裁剪 CI recovery ========
+    print("\n[F1] 裁剪 CI recovery ...")
     f1d = '/tmp/rf1'
+    f1_payload = ci['frags'][1]['payload'] if len(ci['frags']) > 1 else ci['frags'][0]['payload']
+    unpack_lz4_or_raw(f1_payload, f1d)
+    print(f"  base: CI F1 ({len(f1_payload)/1024/1024:.2f} MB LZ4)")
 
-    # 基础：CI F1（TWRP 核心）
-    unpack_lz4(ci['frags'][1]['payload'], f1d)
-    print(f"  base: CI F1 ({len(ci['frags'][1]['payload'])/1024/1024:.2f} MB LZ4)")
+    # 删 vendor 已提供的核心组件
+    for rel in ['system/bin/init', 'system/bin/linker64', 'system/bin/adbd',
+                'system/bin/fastbootd', 'system/bin/toybox']:
+        p = os.path.join(f1d, rel)
+        if os.path.exists(p):
+            os.remove(p)
+            print(f"  removed {os.path.basename(rel)}")
 
-    # 删 CI F1 中 system/lib64/ 下 F0 已有的同名库以节省空间
-    # 但保留 recovery 二进制传递依赖到的库（包括 NDK/HAL 后端及其传递依赖）
-    # 因为 F0 的 API 35 版与 API 36 二进制存在符号兼容问题
+    # 删 CI F1 中与 F0 同名的库
     f0_lib64 = f'{f0d}/system/lib64'
     f1_lib64 = f'{f1d}/system/lib64'
-    deleted_ct = 0
-    deleted_sz = 0
-    kept_ct = 0
-    kept_sz = 0
+    del_ct = 0; del_sz = 0; keep_ct = 0; keep_sz = 0
     if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
-
-        def _readelf_needed(libfile):
-            """return set of NEEDED libs from a shared library or binary"""
-            r = subprocess.run(
-                ['aarch64-linux-gnu-readelf', '-d', libfile],
-                capture_output=True, timeout=15, text=True)
-            result = set()
-            for line in r.stdout.split('\n'):
-                if 'NEEDED' in line:
-                    lib = line.split('[')[1].split(']')[0]
-                    result.add(lib)
-            return result
-
-        # Build set of all CI F1 libs
-        f1_all = set()
-        for lib in os.listdir(f1_lib64):
+        f0_libs = {lib for lib in os.listdir(f0_lib64)
+                   if os.path.isfile(os.path.join(f0_lib64, lib))
+                   and not os.path.islink(os.path.join(f0_lib64, lib))}
+        for lib in list(os.listdir(f1_lib64)):
+            if lib == 'twrp16':
+                continue
             fp = os.path.join(f1_lib64, lib)
-            if os.path.isfile(fp) and not os.path.islink(fp) and lib != 'twrp16':
-                f1_all.add(lib)
-
-        # Start with recovery binary's direct NEEDED deps that exist in F1 and F0
-        recovery_bin = os.path.join(f1d, 'system/bin/recovery')
-        protected = _readelf_needed(recovery_bin) & f1_all
-
-        # Add NDK/HAL backend patterns (API version specific)
-        for lib in f1_all:
-            if (lib.startswith('android.hardware.')
-                    or lib.endswith('-ndk.so')
-                    or lib == 'libbinder_ndk.so'):
-                protected.add(lib)
-
-        # Transitive closure: for each protected lib, protect its deps too
-        changed = True
-        while changed:
-            changed = False
-            for lib in list(protected):
-                libfile = os.path.join(f1_lib64, lib)
-                if not os.path.exists(libfile):
-                    continue
-                needed = _readelf_needed(libfile) & f1_all
-                for dep in needed:
-                    if dep not in protected:
-                        protected.add(dep)
-                        changed = True
-
-        # F0 libs map for dedup
-        f0_map = {lib: os.path.getsize(os.path.join(f0_lib64, lib))
-                  for lib in os.listdir(f0_lib64)
-                  if os.path.isfile(os.path.join(f0_lib64, lib))
-                  and not os.path.islink(os.path.join(f0_lib64, lib))}
-
-        for lib in list(f1_all):
-            fp = os.path.join(f1_lib64, lib)
-            if lib in f0_map and lib not in protected:
+            if not os.path.isfile(fp) or os.path.islink(fp):
+                continue
+            if lib in f0_libs:
                 sz = os.path.getsize(fp)
                 os.remove(fp)
-                deleted_ct += 1
-                deleted_sz += sz
+                del_ct += 1
+                del_sz += sz
             else:
-                sz = os.path.getsize(fp)
-                kept_ct += 1
-                kept_sz += sz
-        print(f"  system/lib64/: kept {kept_ct} ({kept_sz/1024/1024:.2f} MB), "
-              f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
+                keep_ct += 1
+                keep_sz += os.path.getsize(fp)
+        print(f"  system/lib64/: kept {keep_ct} ({keep_sz/1024/1024:.2f} MB), "
+              f"deleted {del_ct} (from F0, {del_sz/1024/1024:.2f} MB)")
 
-    # 在 F1 init.rc 中添加 setenv LD_LIBRARY_PATH
-    # dmesg 显示 /init.recovery.service.rc 先被解析，它的 service recovery 才是生效的
-    # /system/etc/init/hw/init.rc 的重复定义被 ignore，所以两个都要加
+    # setenv 在 F1 的 init.recovery.service.rc 上
     for irc_rel in ['init.recovery.service.rc', 'system/etc/init/hw/init.rc']:
         irc = f'{f1d}/{irc_rel}'
         if os.path.exists(irc):
             with open(irc) as f:
                 c = f.read()
-            tag = 'service recovery /system/bin/recovery\n' \
-                  '    socket recovery stream 422 system system\n' \
-                  '    seclabel u:r:recovery:s0\n    user root'
+            tag = ('service recovery /system/bin/recovery\n'
+                   '    socket recovery stream 422 system system\n'
+                   '    seclabel u:r:recovery:s0\n    user root')
             if tag in c:
                 c = c.replace(tag, tag + '\n    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64')
                 with open(irc, 'w') as f:
                     f.write(c)
                 print(f"  + setenv in F1 {irc_rel}")
 
-    # 删 CI F1 system/bin/ 中非必要的工具（REF 只保留 26 个关键工具）
-    bin_keep = {'recovery', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
-                'resize2fs', 'pigz', 'unpigz', 'tune2fs', 'ziptool', 'fsck.fat',
-                'bu', 'mkfs.fat', 'bash', 'sh', 'touch_report_debug',
-                'sload_f2fs', 'mkfs.f2fs', 'fsck.f2fs', 'sgdisk', 'parted',
-                'mke2fs', 'e2fsdroid', 'blkid'}
-    f1_bin = f'{f1d}/system/bin'
-    if os.path.isdir(f1_bin):
-        bin_del = 0
-        bin_del_sz = 0
-        for f in list(os.listdir(f1_bin)):
-            fp = os.path.join(f1_bin, f)
-            if os.path.isfile(fp) and f not in bin_keep and not os.path.islink(fp):
-                sz = os.path.getsize(fp)
-                os.remove(fp)
-                bin_del += 1
-                bin_del_sz += sz
-        print(f"  system/bin/: deleted {bin_del} tools ({bin_del_sz/1024/1024:.2f} MB), "
-              f"kept critical tools")
-
-    # 叠 stock F1 基础设施：first_stage_ramdisk、vintf manifest、odm、fastboot 服务
-    if len(stk['frags']) > 1 and stk['frags'][1]['size'] > 0:
-        stk1d = '/tmp/rstk1'
-        unpack_lz4(stk['frags'][1]['payload'], stk1d)
-        # 只复制 CI F1 没有的关键基础设施文件
-        infra_dirs = [
-            'first_stage_ramdisk', 'lib/modules',
-            'odm/firmware', 'odm/lib64',
-            'system/etc/vintf/manifest',
-            'vendor/etc/vintf/manifest',
-            'system/lib64/stock-vendor-hal',
-            'system/bin/hw',
-            'system/etc/init',
-        ]
-        for dir_rel in infra_dirs:
-            src_d = os.path.join(stk1d, dir_rel)
-            if not os.path.exists(src_d):
-                continue
-            for root, dirs, files in os.walk(src_d):
-                # Skip files that already exist in CI F1
-                rel = os.path.relpath(root, stk1d)
-                for f in files:
-                    src_f = os.path.join(root, f)
-                    dst_f = os.path.join(f1d, rel, f)
-                    if os.path.exists(dst_f) or os.path.lexists(dst_f):
-                        continue
-                    # Ensure parent chain exists; remove any symlink in the
-                    # way that CI F1 uses as a mount-point placeholder
-                    parent = os.path.dirname(dst_f)
-                    if not os.path.isdir(parent):
-                        if os.path.lexists(parent):
-                            os.unlink(parent)
-                        os.makedirs(parent, exist_ok=True)
-                    if os.path.islink(src_f):
-                        os.symlink(os.readlink(src_f), dst_f)
-                    else:
-                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
-
-        # 补 stock 的 system/bin/ 工具（CI 没有的）
-        for f in ['touch_report_debug']:
-            src = f'{stk1d}/system/bin/{f}'
-            dst = f'{f1d}/system/bin/{f}'
-            if os.path.exists(src) and not os.path.lexists(dst):
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst, follow_symlinks=False)
-
-        # 补 recovery 二进制 NEEDED 但 CI F1 缺失的库（如 libresetprop.so）
-        f1_lib64 = f'{f1d}/system/lib64'
-        needed = subprocess.run(
-            ['aarch64-linux-gnu-readelf', '-d', f'{f1d}/system/bin/recovery'],
-            capture_output=True, timeout=15, text=True)
-        missing_libs = []
-        for line in needed.stdout.split('\n'):
-            if 'NEEDED' not in line:
-                continue
-            lib = line.split('[')[1].split(']')[0]
-            lib_path = f'{f1_lib64}/{lib}'
-            if not os.path.exists(lib_path):
-                # Try stock F1
-                stk_lib = f'{stk1d}/system/lib64/{lib}'
-                if os.path.exists(stk_lib):
-                    os.makedirs(f1_lib64, exist_ok=True)
-                    shutil.copy2(stk_lib, lib_path, follow_symlinks=False)
-                    missing_libs.append(lib)
-                    print(f"  + missing lib from stock F1: {lib}")
-                else:
-                    print(f"  WARNING: {lib} not found in stock F1 either!")
-
-        shutil.rmtree(stk1d)
-        print(f"  + stock infrastructure (first_stage_ramdisk, modules, odm, vintf)")
-
-    # 补 init、sbin/sh 等 symlink（从 F0）
+    # 补 init 等 symlink
     for item in ['init', 'sbin/sh', 'default.prop']:
         dst = f'{f1d}/{item}'
         src = f'{f0d}/{item}'
@@ -358,58 +219,61 @@ def main():
     print(f"  F1: {len(f1)/1024/1024:.2f} MB LZ4")
     print(f"  Total: {(len(f0)+len(f1))/1024/1024:.2f} MB")
 
-    # ---- 构建 vendor_boot ----
+    if len(f0) + len(f1) + align(len(stk['dtb']), PAGE_SIZE) + 2*ENTRY_SIZE > PARTITION_SIZE:
+        print("  ERROR: Total exceeds 64MB partition!", file=sys.stderr)
+        sys.exit(1)
+
+    # ======== 构建 vendor_boot ========
     print("\n构建 vendor_boot ...")
     rsz = len(f0) + len(f1)
     rs = PAGE_SIZE
-    re = rs + rsz
-    ds = align(re, PAGE_SIZE)
+    ds = align(rs + rsz, PAGE_SIZE)
     de = ds + len(stk['dtb'])
-    ts = 2 * ENTRY_SIZE
-    to = align(de, PAGE_SIZE)
 
     img = bytearray(PARTITION_SIZE)
+    # 复制原 header 再修改所需字段
     img[:PAGE_SIZE] = stk['page0'][:PAGE_SIZE]
     struct.pack_into('<I', img, 24, rsz)
     struct.pack_into('<I', img, DTB_OFF, len(stk['dtb']))
+
+    # ramdisk 数据区域
     img[rs:rs + len(f0)] = f0
     img[rs + len(f0):rs + rsz] = f1
+
+    # DTB
     if stk['dtb']:
         img[ds:de] = stk['dtb']
 
-    def entry(sz, off, typ, name):
-        e = bytearray(ENTRY_SIZE)
-        struct.pack_into('<I', e, 0, sz)
-        struct.pack_into('<I', e, 4, off)
-        struct.pack_into('<I', e, 8, typ)
-        nb = name.encode()[:31] + b'\x00'
-        e[12:12 + len(nb)] = nb
-        return e
+    # fragment 表在 header（page0）内，从 tbl_off 开始
+    tbl_off = struct.unpack_from('<I', stk['page0'], TBL_OFF)[0]
+    e0 = bytearray(ENTRY_SIZE)
+    struct.pack_into('<I', e0, 0, len(f0))           # sz
+    struct.pack_into('<I', e0, 4, 0)                  # off (start of ramdisk)
+    struct.pack_into('<I', e0, 8, 1)                  # type=1 (vendor)
+    nb0 = b'\x00' * 32
+    e0[12:44] = nb0
+    img[tbl_off:tbl_off + ENTRY_SIZE] = e0
 
-    img[to:to + ENTRY_SIZE] = entry(len(f0), 0, 1, '')
-    img[to + ENTRY_SIZE:to + 2 * ENTRY_SIZE] = entry(len(f1), len(f0), 2, '')
-    struct.pack_into('<I', img, TBL_OFF, ts)
-    struct.pack_into('<I', img, TBL_OFF + 4, 2)
-    struct.pack_into('<I', img, TBL_OFF + 8, ENTRY_SIZE)
+    e1 = bytearray(ENTRY_SIZE)
+    struct.pack_into('<I', e1, 0, len(f1))            # sz
+    struct.pack_into('<I', e1, 4, len(f0))            # off (after F0)
+    struct.pack_into('<I', e1, 8, 2)                  # type=2 (recovery)
+    nb1 = b'\x00' * 32
+    e1[12:44] = nb1
+    img[tbl_off + ENTRY_SIZE:tbl_off + 2 * ENTRY_SIZE] = e1
 
     with open(args.output, 'wb') as f:
         f.write(bytes(img))
     assert os.path.getsize(args.output) == PARTITION_SIZE
 
     print(f"\n输出: {args.output}")
-    print(f"大小: {PARTITION_SIZE/1024/1024:.0f} MB")
-    print(f"  F0: {len(f0)/1024/1024:.2f} MB (vendor, twrp16/, setenv)")
-    print(f"  F1: {len(f1)/1024/1024:.2f} MB (TWRP)")
+    print(f"  64 MB (F0: {len(f0)/1024/1024:.2f} + F1: {len(f1)/1024/1024:.2f} MB LZ4)")
     print("完成!")
 
-    # Cleanup
     for d in ['/tmp/rf0', '/tmp/rci1', '/tmp/rf1']:
-        if os.path.exists(d):
-            shutil.rmtree(d)
+        if os.path.exists(d): shutil.rmtree(d)
     for f in ['/tmp/rf0.lz4', '/tmp/rf1.lz4']:
-        if os.path.exists(f):
-            os.remove(f)
-
+        if os.path.exists(f): os.remove(f)
 
 if __name__ == '__main__':
     main()
