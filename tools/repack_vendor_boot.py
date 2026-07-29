@@ -1,152 +1,276 @@
 #!/usr/bin/env python3
 """
-Replace recovery fragment in a vendor_boot v4 image for dash (Redmi Turbo 5 Max).
+TWRP vendor_boot 重打包工具 — for Redmi Turbo 5 Max (dash)
 
-Usage:
+用法:
     python3 tools/repack_vendor_boot.py \\
-        --template /path/to/dash-twrp16-v1.0.0-rc1-vendor_boot.img \\
-        --fragment /path/to/recovery-only-fragment.lz4
+        --stock    /path/to/stock_vendor_boot.img \\
+        --ci       /path/to/ci_vendor_boot.img \\
+        --ref      /path/to/reference_vendor_boot.img \\
+        [--output  /path/to/output.img]
 
-The template image (rc1) has a custom vendor ramdisk with system/lib64/twrp16/
-library directory that API-36 recovery needs. The script replaces only fragment 1
-(recovery ramdisk), preserving vendor ramdisk, DTB, and AVB footer.
+流程:
+  1. 从 stock F0 取 vendor ramdisk → 删 recovery binary + res/
+     → 加 twrp16/（9 个 API36 库，从 CI F1 提取）
+     → init.rc service recovery 内加 setenv LD_LIBRARY_PATH
+  2. 从 CI F1 取 TWRP recovery → 按 ref_f1_whitelist.txt 白名单过滤
+     → 白名单有但 CI 缺的文件从 REF F1/F0 补入
+  3. 构建 MTK 双 fragment vendor_boot v4 → 64MB 镜像
 """
-import struct, sys, argparse
+import struct, subprocess, os, shutil, sys, argparse
 
-PARTITION_SIZE = 67108864  # 64 MB
+PARTITION_SIZE = 67108864
+PAGE_SIZE = 4096
+ENTRY_SIZE = 108
+HS_OFF = 2096
+DTB_OFF = 2100
+TBL_OFF = 2112
+WHITELIST = os.path.join(os.path.dirname(__file__), 'ref_f1_whitelist.txt')
 
 
-def align(value, alignment):
-    return (value + alignment - 1) // alignment * alignment
+def align(v, a):
+    return (v + a - 1) // a * a
 
 
-def parse_vendor_boot(image):
-    if image[:8] != b"VNDRBOOT":
-        raise ValueError("not a vendor_boot image")
-    version, page_size, _, _, ramdisk_size = struct.unpack_from("<IIIII", image, 8)
-    header_size, dtb_size = struct.unpack_from("<II", image, 2096)
-    table_size, entry_count, entry_size, bootconfig_size = struct.unpack_from("<IIII", image, 2112)
-
-    ramdisk_offset = align(header_size, page_size)
-    ramdisk_end = ramdisk_offset + ramdisk_size
-    dtb_offset = align(ramdisk_end, page_size)
-    dtb_end = dtb_offset + dtb_size
-    table_offset = align(dtb_end, page_size)
-
-    entries = []
-    for index in range(entry_count):
-        eo = table_offset + index * entry_size
-        sz, off, frag_type = struct.unpack_from("<III", image, eo)
-        name = image[eo + 12:eo + 44].split(b"\0", 1)[0].decode()
-        payload = image[ramdisk_offset + off:ramdisk_offset + off + sz]
-        entries.append({
-            "index": index, "size": sz, "offset": off,
-            "type": frag_type, "name": name,
-            "payload": payload, "raw_entry": image[eo:eo + entry_size],
-        })
-
+def get_frags(img_path):
+    """解析 MTK vendor_boot v4 双 fragment 结构。"""
+    with open(img_path, 'rb') as f:
+        d = f.read()
+    hs = struct.unpack_from('<I', d, HS_OFF)[0]
+    ds = struct.unpack_from('<I', d, DTB_OFF)[0]
+    rs = struct.unpack_from('<I', d, 24)[0]
+    ec = struct.unpack_from('<I', d, TBL_OFF + 4)[0]
+    es = struct.unpack_from('<I', d, TBL_OFF + 8)[0]
+    ro = align(hs, PAGE_SIZE)
+    dtbo = align(ro + rs, PAGE_SIZE)
+    tblo = align(dtbo + align(ds, PAGE_SIZE), PAGE_SIZE)
+    frags = []
+    for i in range(ec):
+        eo = tblo + i * es
+        sz = struct.unpack_from('<I', d, eo)[0]
+        off = struct.unpack_from('<I', d, eo + 4)[0]
+        typ = struct.unpack_from('<I', d, eo + 8)[0]
+        name = d[eo + 12:eo + 44].rstrip(b'\x00').decode()
+        payload = d[ro + off:ro + off + sz]
+        frags.append({'size': sz, 'offset': off, 'type': typ, 'name': name, 'payload': payload})
+    dtb_data = b''
+    for o in range(dtbo, min(dtbo + 8192, len(d))):
+        if d[o:o + 4] == b'\xd0\x0d\xfe\xed':
+            dtb_sz = struct.unpack_from('>I', d, o + 4)[0]
+            dtb_data = d[o:o + dtb_sz]
+            break
+    avb = d[-4096:] if d[-8:-4] == b'AVBf' else None
     return {
-        "version": version,
-        "page_size": page_size,
-        "header_size": header_size,
-        "ramdisk_size": ramdisk_size,
-        "ramdisk_offset": ramdisk_offset,
-        "dtb_size": dtb_size,
-        "dtb_offset": dtb_offset,
-        "dtb_end": dtb_end,
-        "table_size": table_size,
-        "table_offset": table_offset,
-        "entry_count": entry_count,
-        "entry_size": entry_size,
-        "bootconfig_size": bootconfig_size,
-        "entries": entries,
-        "bootconfig_end": table_offset,
-        "avb_footer": image[-4096:] if image[-8:-4] == b"AVBf" else None,
+        'hs': hs, 'ds': ds, 'ro': ro, 'dtbo': dtbo, 'tblo': tblo,
+        'frags': frags, 'dtb': dtb_data, 'avb': avb, 'page0': d[:PAGE_SIZE],
     }
 
 
+def unpack(img, dest):
+    """解压 LZ4 cpio 到目录。"""
+    if os.path.exists(dest):
+        shutil.rmtree(dest)
+    os.makedirs(dest)
+    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin'], input=img,
+                       capture_output=True, timeout=30)
+    if r.returncode != 0:
+        return None
+    subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True,
+                   timeout=30, cwd=dest)
+    return r.stdout
+
+
+def pack_cpio(src):
+    """目录打包为 cpio。"""
+    r = subprocess.run(['find', '.', '-print0'], capture_output=True, timeout=10, cwd=src)
+    p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'],
+                       input=r.stdout, capture_output=True, timeout=60, cwd=src)
+    return p.stdout
+
+
+def pack_lz4(src, out):
+    """目录 → cpio → LZ4 -l -9。"""
+    cpio = pack_cpio(src)
+    if cpio is None:
+        return None
+    subprocess.run(['lz4', '-l', '-9', '--force', '-', out],
+                   input=cpio, capture_output=True, timeout=60)
+    return open(out, 'rb').read()
+
+
+def build_image(f0, f1, dtb, page0, out):
+    """构建 64MB MTK vendor_boot v4。"""
+    rsz = len(f0) + len(f1)
+    rs = PAGE_SIZE
+    re = rs + rsz
+    ds = align(re, PAGE_SIZE)
+    de = ds + len(dtb)
+    ts = 2 * ENTRY_SIZE
+    to = align(de, PAGE_SIZE)
+    img = bytearray(PARTITION_SIZE)
+    img[:PAGE_SIZE] = page0[:PAGE_SIZE]
+    struct.pack_into('<I', img, 24, rsz)
+    struct.pack_into('<I', img, DTB_OFF, len(dtb))
+    img[rs:rs + len(f0)] = f0
+    img[rs + len(f0):rs + rsz] = f1
+    if dtb:
+        img[ds:de] = dtb
+
+    def entry(sz, off, typ, name):
+        e = bytearray(ENTRY_SIZE)
+        struct.pack_into('<I', e, 0, sz)
+        struct.pack_into('<I', e, 4, off)
+        struct.pack_into('<I', e, 8, typ)
+        nb = name.encode()[:31] + b'\x00'
+        e[12:12 + len(nb)] = nb
+        return e
+
+    img[to:to + ENTRY_SIZE] = entry(len(f0), 0, 1, '')
+    img[to + ENTRY_SIZE:to + 2 * ENTRY_SIZE] = entry(len(f1), len(f0), 2, '')
+    struct.pack_into('<I', img, TBL_OFF, ts)
+    struct.pack_into('<I', img, TBL_OFF + 4, 2)
+    struct.pack_into('<I', img, TBL_OFF + 8, ENTRY_SIZE)
+    with open(out, 'wb') as f:
+        f.write(bytes(img))
+    assert os.path.getsize(out) == PARTITION_SIZE
+
+
+def load_whitelist(path):
+    if not os.path.exists(path):
+        print(f"ERROR: whitelist not found: {path}", file=sys.stderr)
+        return None
+    with open(path) as f:
+        return set(l.strip() for l in f if l.strip())
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Repack vendor_boot v4 with new recovery fragment")
-    parser.add_argument("--template", required=True, help="rc1 template vendor_boot image")
-    parser.add_argument("--fragment", required=True, help="new recovery fragment (LZ4 cpio)")
-    parser.add_argument("--output", default="/tmp/dash-UNTESTED-vendor_boot.img", help="output image path")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description='TWRP vendor_boot repack for dash')
+    ap.add_argument('--stock', required=True)
+    ap.add_argument('--ci', required=True)
+    ap.add_argument('--ref', required=True)
+    ap.add_argument('--output', default='/tmp/dash-UNTESTED-vendor_boot.img')
+    ap.add_argument('--whitelist', default=WHITELIST)
+    args = ap.parse_args()
 
-    # Load template
-    data = open(args.template, "rb").read()
-    c = parse_vendor_boot(data)
+    for p in [args.stock, args.ci, args.ref]:
+        if not os.path.exists(p):
+            print(f"ERROR: {p} not found", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"Template: {args.template}")
-    print(f"Entries: {c['entry_count']}")
-    for e in c['entries']:
-        print(f"  [{e['index']}] type={e['type']} name='{e['name']}' size={e['size']}")
+    ref = get_frags(args.ref)
+    stk = get_frags(args.stock)
+    ci = get_frags(args.ci)
+    print(f"Stock: {len(stk['frags'])} frags, CI: {len(ci['frags'])} frags")
 
-    # Load new fragment
-    new_fragment = open(args.fragment, "rb").read()
-    print(f"\nNew fragment: {len(new_fragment)} bytes")
+    # ---- F0 ----
+    print("\n[F0] Modifying stock vendor ramdisk ...")
+    f0_dir = '/tmp/rf0'
+    unpack(stk['frags'][0]['payload'], f0_dir)
+    for p in [f'{f0_dir}/system/bin/recovery', f'{f0_dir}/res']:
+        if os.path.exists(p):
+            (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
 
-    # Build full 64MB image
-    result = bytearray(PARTITION_SIZE)
+    ci_f1_dir = '/tmp/rci1'
+    unpack(ci['frags'][1]['payload'], ci_f1_dir)
+    twrp16 = ['libbase.so', 'libbootloader_message.so', 'libc++.so', 'libcutils.so',
+              'libfs_mgr.so', 'liblog.so', 'liblp.so', 'libprotobuf-cpp-lite.so', 'libutils.so']
+    tdir = f'{f0_dir}/system/lib64/twrp16'
+    os.makedirs(tdir, exist_ok=True)
+    for lib in twrp16:
+        s = f'{ci_f1_dir}/system/lib64/{lib}'
+        if os.path.exists(s):
+            shutil.copy2(s, f'{tdir}/{lib}', follow_symlinks=False)
 
-    # Copy header, update ramdisk_size
-    result[:c['header_size']] = data[:c['header_size']]
-    new_ramdisk_size = c['entries'][0]['size'] + len(new_fragment)
-    struct.pack_into("<I", result, 24, new_ramdisk_size)
+    irc = f'{f0_dir}/system/etc/init/hw/init.rc'
+    if os.path.exists(irc):
+        with open(irc) as f:
+            c = f.read()
+        tag = 'service recovery /system/bin/recovery\n' \
+              '    socket recovery stream 422 system system\n' \
+              '    seclabel u:r:recovery:s0\n    user root'
+        if tag in c:
+            c = c.replace(tag, tag + '\n    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64')
+            with open(irc, 'w') as f:
+                f.write(c)
 
-    page = c['page_size']
-    new_ramdisk_offset = align(c['header_size'], page)
-    new_dtb_offset = align(new_ramdisk_offset + new_ramdisk_size, page)
-    new_dtb_end = new_dtb_offset + c['dtb_size']
-    new_table_offset = align(new_dtb_end, page)
-    new_table_end = new_table_offset + c['entry_count'] * c['entry_size']
-    new_bootconfig_offset = align(new_table_end, page)
-    new_bootconfig_end = new_bootconfig_offset + c['bootconfig_size']
+    f0 = pack_lz4(f0_dir, '/tmp/rf0.lz4')
+    print(f"  F0: {len(f0)/1024/1024:.2f} MB LZ4")
 
-    # Fragment 0 (vendor ramdisk) — unchanged
-    result[new_ramdisk_offset:new_ramdisk_offset + c['entries'][0]['size']] = c['entries'][0]['payload']
+    # ---- F1 ----
+    print("\n[F1] Filtering CI recovery by REF whitelist ...")
+    wl = load_whitelist(args.whitelist)
+    if wl is None:
+        sys.exit(1)
 
-    # Fragment 1 (recovery ramdisk) — replaced
-    frag1_offset = new_ramdisk_offset + c['entries'][0]['size']
-    result[frag1_offset:frag1_offset + len(new_fragment)] = new_fragment
+    f1_dir = '/tmp/rf1'
+    unpack(ci['frags'][1]['payload'], f1_dir)
 
-    # DTB — unchanged
-    result[new_dtb_offset:new_dtb_end] = data[c['dtb_offset']:c['dtb_end']]
+    for root, dirs, files in os.walk(f1_dir, topdown=False):
+        for f in files:
+            fp = os.path.join(root, f)
+            if os.path.relpath(fp, f1_dir) not in wl:
+                os.remove(fp)
+        for d in dirs:
+            dp = os.path.join(root, d)
+            r = os.path.relpath(dp, f1_dir) + '/'
+            if r not in wl:
+                try:
+                    shutil.rmtree(dp)
+                except OSError:
+                    pass
+    for item in list(os.listdir(f1_dir)):
+        fp = os.path.join(f1_dir, item)
+        r = item + '/' if os.path.isdir(fp) and not os.path.islink(fp) else item
+        if r not in wl:
+            try:
+                (shutil.rmtree if os.path.isdir(fp) and not os.path.islink(fp) else os.remove)(fp)
+            except OSError:
+                pass
 
-    # Entry table — preserve original type/name, update size/offset
-    for i, e in enumerate(c['entries']):
-        eo = new_table_offset + i * c['entry_size']
-        result[eo:eo + c['entry_size']] = e['raw_entry']
-        if i == 0:
-            struct.pack_into("<I", result, eo, e['size'])
-            struct.pack_into("<I", result, eo + 4, 0)
-        elif i == 1:
-            struct.pack_into("<I", result, eo, len(new_fragment))
-            struct.pack_into("<I", result, eo + 4, c['entries'][0]['size'])
+    missing = [r for r in wl if not r.endswith('/')
+               and not os.path.exists(os.path.join(f1_dir, r))]
+    if missing:
+        print(f"  Missing {len(missing)} items from CI, filling from REF ...")
+        rf1_dir = '/tmp/rrf1'
+        rf0_dir = '/tmp/rrf0'
+        unpack(ref['frags'][1]['payload'], rf1_dir)
+        unpack(ref['frags'][0]['payload'], rf0_dir)
+        for item in missing:
+            for sd, lb in [(rf1_dir, 'REF F1'), (rf0_dir, 'REF F0')]:
+                src = os.path.join(sd, item)
+                dst = os.path.join(f1_dir, item)
+                if os.path.lexists(src):
+                    dd = os.path.dirname(dst)
+                    if os.path.islink(dd):
+                        os.unlink(dd)
+                    if not os.path.exists(dd):
+                        os.makedirs(dd, exist_ok=True)
+                    if os.path.lexists(dst):
+                        os.unlink(dst)
+                    if os.path.islink(src):
+                        os.symlink(os.readlink(src), dst)
+                    else:
+                        shutil.copy2(src, dst, follow_symlinks=False)
+                    break
+        shutil.rmtree(rf1_dir)
+        shutil.rmtree(rf0_dir)
 
-    # Bootconfig
-    if c['bootconfig_size'] > 0:
-        result[new_bootconfig_end - c['bootconfig_size']:new_bootconfig_end] = \
-            data[c['bootconfig_end'] - c['bootconfig_size']:c['bootconfig_end']]
+    f1 = pack_lz4(f1_dir, '/tmp/rf1.lz4')
+    print(f"  F1: {len(f1)/1024/1024:.2f} MB LZ4")
+    print(f"  Total: {(len(f0)+len(f1))/1024/1024:.2f} MB")
 
-    # AVB footer
-    if c['avb_footer']:
-        result[-4096:] = c['avb_footer']
-
-    # Verify
+    # ---- Build ----
+    print("\nBuilding vendor_boot ...")
+    build_image(f0, f1, stk['dtb'], stk['page0'], args.output)
     print(f"\nOutput: {args.output}")
-    print(f"Size: {len(result)} bytes ({len(result) / 1024 / 1024:.1f} MB)")
-    assert len(result) == PARTITION_SIZE
-    v = struct.unpack_from("<I", result, 24)[0]
-    assert v == new_ramdisk_size, f"ramdisk_size mismatch: {v} != {new_ramdisk_size}"
-    print(f"Fragment 0: {c['entries'][0]['size']}")
-    print(f"Fragment 1: {len(new_fragment)}")
-    print(f"DTB: {c['dtb_size']}")
-    print(f"AVB footer: {'present' if c['avb_footer'] else 'missing'}")
+    print(f"Size: {os.path.getsize(args.output)/1024/1024:.2f} MB")
+    print("Done!")
 
-    with open(args.output, "wb") as f:
-        f.write(bytes(result))
-    print(f"\nWritten: {args.output}")
+    for d in ['/tmp/rf0', '/tmp/rci1', '/tmp/rf1', '/tmp/rrf1', '/tmp/rrf0',
+              '/tmp/rf0.lz4', '/tmp/rf1.lz4']:
+        if os.path.exists(d):
+            (shutil.rmtree if os.path.isdir(d) else os.remove)(d)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
