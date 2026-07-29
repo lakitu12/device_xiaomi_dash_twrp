@@ -48,7 +48,15 @@ lz4 -l -12 --favor-decSpeed /tmp/twrp.cpio /tmp/twrp-fragment.lz4
 
 ## 重打包
 
-CI 构建输出一个 `vendor_boot.img`（fragment 0 为空，fragment 1 为自包含 recovery），不能直接刷写。需结合 rc1 模板（含 `system/lib64/twrp16/` 兼容库）重打包。
+流程：原厂 `vendor_boot.img` → 改造 vendor ramdisk（rc1 风格）→ 制作 CJK recovery ramdisk → 重打包。
+
+### 0. 准备材料
+
+| 材料 | 说明 | 来源 |
+|------|------|------|
+| 原厂 `vendor_boot.img` | 设备原始 vendor_boot 分区备份 | `adb pull /dev/block/by-name/vendor_boot` |
+| CI 构建产物 | CI 输出的 `vendor_boot.img`（fragment 0 为空） | GitHub Actions |
+| rc1 premade recovery | rc1 的 TWRP recovery ramdisk（80 库的轻量基） | 设备树预编译目录 |
 
 ### 1. 提取 CI recovery fragment
 
@@ -82,7 +90,7 @@ cp ci-recovery-root/twres/fonts/NotoSansCJKsc-Regular.ttf twres/fonts/
 cp ci-recovery-root/twres/languages/*.xml twres/languages/
 
 # 保留 stock-vendor-hal/（keymint/gatekeeper/weaver 服务依赖）
-# 删除重复非必要文件（vendor 已提供）
+# 删除重复工具（vendor 已提供）
 rm -f system/bin/fastbootd
 
 # LZ4 压缩
@@ -90,7 +98,49 @@ find . | cpio -o -H newc > /tmp/twrp.cpio
 lz4 -l -9 /tmp/twrp.cpio /tmp/twrp-cjk.lz4
 ```
 
-### 3. 重打包
+### 3. 改造 vendor ramdisk（rc1 风格）
+
+从原厂 vendor ramdisk 出发，只做三处修改：
+
+```bash
+# 解压原厂 vendor ramdisk
+lz4 -d stock-vendor-frag.lz4 /dev/stdout | cpio -id
+
+# 修改 1：删除原厂 recovery binary（TWRP 替代）
+rm -f system/bin/recovery
+
+# 修改 2：删除 res/（MIUI 恢复 UI，TWRP 不需要）
+rm -rf res/
+
+# 修改 3：添加 twrp16/ 兼容库
+mkdir -p system/lib64/twrp16
+# 从 CI 或 rc1 中复制 9 个 API 36 系统库：
+# libbase.so libbootloader_message.so libc++.so libcutils.so
+# libfs_mgr.so liblog.so liblp.so libprotobuf-cpp-lite.so libutils.so
+
+# 修改 4：init.rc 在 service recovery 内部添加 setenv
+# 找到 service recovery 定义，在 user root 后添加：
+#     setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
+
+# LZ4 压缩
+find . | cpio -o -H newc > /tmp/vendor-mod.cpio
+lz4 -l -9 /tmp/vendor-mod.cpio /tmp/vendor-mod.lz4
+```
+
+### 4. 重打包为 vendor_boot
+
+```bash
+# 用修改后的 vendor ramdisk 和 CJK recovery 手动构建
+python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
+    --template /path/to/stock/vendor_boot.img \
+    --fragment /tmp/twrp-cjk.lz4 \
+    --output dash-CJK-vendor_boot.img
+```
+
+但这里有个问题——`repack_vendor_boot.py` 会保留 fragment 0（vendor ramdisk）原样。所以需要先准备好一个**已改造好 vendor ramdisk 的 template**，或者分两步：
+
+**方法 A（推荐）：用 rc1 template 作为基**
+rc1 已经包含了 vendor ramdisk 的改造。直接用 repack 脚本替换 recovery 即可：
 
 ```bash
 python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
@@ -99,7 +149,10 @@ python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
     --output dash-CJK-vendor_boot.img
 ```
 
-### 4. 刷入
+**方法 B（从零开始）：改造原厂 vendor ramdisk 后手动打包**
+先用步骤 3 改造 vendor ramdisk，然后手动构建 vendor_boot（参考 `repack_vendor_boot.py` 源码）。
+
+### 5. 刷入
 
 ```bash
 adb reboot bootloader
@@ -109,9 +162,9 @@ fastboot reboot
 
 刷前备份原厂 vendor_boot。dash 是 VAB 结构，`vendor_boot` 分槽位，刷前确认活动槽。
 
-### rc1 模板的兼容层原理
+### rc1 template 的兼容层原理
 
-rc1 在 vendor ramdisk（fragment 0）中修改了两处，使得 API 36 编译的 recovery 能在 API 35 的 vendor 环境中运行：
+rc1 template 的 vendor ramdisk 基于原厂做了两处修改，使得 API 36 编译的 recovery 能在 API 35 的 vendor 环境中运行：
 
 1. **`system/etc/init/hw/init.rc`** — 在 `service recovery` 内部添加：
    ```
