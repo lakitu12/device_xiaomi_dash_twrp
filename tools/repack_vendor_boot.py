@@ -160,24 +160,71 @@ def main():
     print(f"  base: CI F1 ({len(ci['frags'][1]['payload'])/1024/1024:.2f} MB LZ4)")
 
     # 删 CI F1 中 system/lib64/ 下 F0 已有的库（同名不论版本）
-    # F1 的 system/lib64/ 全部保留——F0 版本是 API 35，F1 是 API 36
-    # 删掉 F1 的库会导致 init/recovery 用错 API 版本，linker 崩溃
+    # F1 的 system/lib64/ 中删掉 F0 已提供的库（系统库由 vendor 提供）
+    # 只保留 TWRP 独有库
+    f0_lib64 = f'{f0d}/system/lib64'
     f1_lib64 = f'{f1d}/system/lib64'
-    print(f"  system/lib64/: kept {len(os.listdir(f1_lib64))} CI libs (no dedup - API 36 required)")
+    deleted_ct = 0
+    deleted_sz = 0
+    kept_ct = 0
+    kept_sz = 0
+    if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
+        f0_set = set()
+        for lib in os.listdir(f0_lib64):
+            fp = os.path.join(f0_lib64, lib)
+            if os.path.isfile(fp) and not os.path.islink(fp):
+                f0_set.add(lib)
+        for lib in list(os.listdir(f1_lib64)):
+            if lib == 'twrp16':
+                continue
+            fp = os.path.join(f1_lib64, lib)
+            if not os.path.isfile(fp) or os.path.islink(fp):
+                continue
+            if lib in f0_set:
+                sz = os.path.getsize(fp)
+                os.remove(fp)
+                deleted_ct += 1
+                deleted_sz += sz
+            else:
+                sz = os.path.getsize(fp)
+                kept_ct += 1
+                kept_sz += sz
+        print(f"  system/lib64/: kept {kept_ct} TWRP-unique ({kept_sz/1024/1024:.2f} MB), "
+              f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
 
-    # 删 CI F1 system/bin/ 中非必要的工具（REF 只保留 26 个关键工具）
-    bin_keep = {'recovery', 'init', 'linker64', 'adbd', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
-                'resize2fs', 'pigz', 'unpigz', 'tune2fs', 'ziptool', 'fsck.fat',
-                'bu', 'mkfs.fat', 'bash', 'sh', 'touch_report_debug',
-                'sload_f2fs', 'mkfs.f2fs', 'fsck.f2fs', 'sgdisk', 'parted',
-                'mke2fs', 'e2fsdroid', 'blkid'}
+    # 删 CI F1 中多余的 init 服务定义和 binary（F0 已有原厂版本）
+    for rc in ['keystore2.rc','servicemanager.rc','hwservicemanager.rc','vndservicemanager.rc']:
+        p = f'{f1d}/system/etc/init/{rc}'
+        if os.path.exists(p): os.remove(p)
+    for b in ['keystore2','keystore_cli_v2','servicemanager','hwservicemanager','vndservicemanager','fscryptpolicyget']:
+        p = f'{f1d}/system/bin/{b}'
+        if os.path.exists(p): os.remove(p)
+    print(f"  removed CI service binaries and init files (F0 provides native versions)")
+
+    # 删 CI 的 keystore2 vintf/selinux（F0 提供原厂版本）
+    for d in ['system/etc/vintf','system/etc/selinux','vendor/etc']:
+        p = f'{f1d}/{d}'
+        if os.path.exists(p): shutil.rmtree(p)
+    # F0 提供的系统工具直接删（init、linker64、adbd、fastbootd、toybox 等）
+    f0_bin_set = set()
+    if os.path.isdir(f'{f0d}/system/bin'):
+        for f in os.listdir(f'{f0d}/system/bin'):
+            fp = os.path.join(f'{f0d}/system/bin', f)
+            if os.path.isfile(fp) and not os.path.islink(fp):
+                f0_bin_set.add(f)
+    
+    # 要保留的 TWRP 关键工具
+    twrp_bins = {'recovery', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
+                 'resize2fs', 'pigz', 'unpigz', 'tune2fs', 'ziptool', 'fsck.fat',
+                 'bu', 'bash', 'sh', 'touch_report_debug',
+                 'sload_f2fs', 'parted', 'mke2fs', 'e2fsdroid', 'blkid'}
     f1_bin = f'{f1d}/system/bin'
     if os.path.isdir(f1_bin):
         bin_del = 0
         bin_del_sz = 0
         for f in list(os.listdir(f1_bin)):
             fp = os.path.join(f1_bin, f)
-            if os.path.isfile(fp) and f not in bin_keep and not os.path.islink(fp):
+            if os.path.isfile(fp) and f not in twrp_bins and f in f0_bin_set:
                 sz = os.path.getsize(fp)
                 os.remove(fp)
                 bin_del += 1
