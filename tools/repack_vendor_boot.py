@@ -231,36 +231,41 @@ def main():
     de = ds + len(stk['dtb'])
 
     img = bytearray(PARTITION_SIZE)
-    # 复制原 header 再修改所需字段
     img[:PAGE_SIZE] = stk['page0'][:PAGE_SIZE]
     struct.pack_into('<I', img, 24, rsz)
-    struct.pack_into('<I', img, DTB_OFF, len(stk['dtb']))
+    struct.pack_into('<I', img, DTB_OFF, stk['ds'])
 
-    # ramdisk 数据区域
     img[rs:rs + len(f0)] = f0
     img[rs + len(f0):rs + rsz] = f1
 
-    # DTB
-    if stk['dtb']:
-        img[ds:de] = stk['dtb']
+    # DTB 区域：64 字节 MTK 表头 + FDT 数据
+    # 表头从原厂 page0 之后/ramdisk 之后复制
+    if stk['ds'] > 0:
+        # 从原厂提取完整的 DTB 区域（64 字节表头 + FDT 数据）
+        # 表头固定 64 字节，数据紧接其后
+        dtb_header = stk['dtb']  # This may be just the FDT (535899 bytes without header)
+        # Better: read directly from stock
+        raw_stk = open(args.stock, 'rb').read()
+        stk_dtbo = align(align(stk['hs'], PAGE_SIZE) + stk['rs'], PAGE_SIZE)
+        # Find actual DTB start (with the 64-byte header)
+        dtb_region_start = None
+        for o in range(stk_dtbo, min(stk_dtbo + 256, len(raw_stk))):
+            if raw_stk[o:o+4] == b'\xd0\x0d\xfe\xed':
+                dtb_region_start = o - 64  # 64-byte header starts 64 bytes before DTB magic
+                break
+        if dtb_region_start is not None and dtb_region_start >= stk_dtbo:
+            dtb_region = raw_stk[dtb_region_start:dtb_region_start + stk['ds']]
+            img[ds:ds + stk['ds']] = dtb_region
+            print(f"  DTB: {stk['ds']}-byte region (64B header + FDT) at {ds}")
+        else:
+            # Fallback: just write 64-byte header from stock page0 area + FDT
+            print(f"  WARNING: could not find DTB region in stock")
 
     # fragment 表在 header（page0）内，从 tbl_off 开始
     tbl_off = struct.unpack_from('<I', stk['page0'], TBL_OFF)[0]
-    e0 = bytearray(ENTRY_SIZE)
-    struct.pack_into('<I', e0, 0, len(f0))           # sz
-    struct.pack_into('<I', e0, 4, 0)                  # off (start of ramdisk)
-    struct.pack_into('<I', e0, 8, 1)                  # type=1 (vendor)
-    nb0 = b'\x00' * 32
-    e0[12:44] = nb0
-    img[tbl_off:tbl_off + ENTRY_SIZE] = e0
-
-    e1 = bytearray(ENTRY_SIZE)
-    struct.pack_into('<I', e1, 0, len(f1))            # sz
-    struct.pack_into('<I', e1, 4, len(f0))            # off (after F0)
-    struct.pack_into('<I', e1, 8, 2)                  # type=2 (recovery)
-    nb1 = b'\x00' * 32
-    e1[12:44] = nb1
-    img[tbl_off + ENTRY_SIZE:tbl_off + 2 * ENTRY_SIZE] = e1
+    # 设备使用单 ramdisk 模式（fragment 表全零），F0+F1 拼接为一个 ramdisk
+    # 不写入 fragment entries，保持全零（原厂和参考镜像都是零）
+    img[tbl_off:tbl_off + 2 * ENTRY_SIZE] = b'\x00' * (2 * ENTRY_SIZE)
 
     with open(args.output, 'wb') as f:
         f.write(bytes(img))
