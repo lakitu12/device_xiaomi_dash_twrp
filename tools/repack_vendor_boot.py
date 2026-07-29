@@ -166,7 +166,7 @@ def main():
     print(f"  system/lib64/: kept {len(os.listdir(f1_lib64))} CI libs (no dedup - API 36 required)")
 
     # 删 CI F1 system/bin/ 中非必要的工具（REF 只保留 26 个关键工具）
-    bin_keep = {'recovery', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
+    bin_keep = {'recovery', 'init', 'linker64', 'adbd', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
                 'resize2fs', 'pigz', 'unpigz', 'tune2fs', 'ziptool', 'fsck.fat',
                 'bu', 'mkfs.fat', 'bash', 'sh', 'touch_report_debug',
                 'sload_f2fs', 'mkfs.f2fs', 'fsck.f2fs', 'sgdisk', 'parted',
