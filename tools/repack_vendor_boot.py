@@ -160,13 +160,19 @@ def main():
     print(f"  base: CI F1 ({len(ci['frags'][1]['payload'])/1024/1024:.2f} MB LZ4)")
 
     # 删 CI F1 中 system/lib64/ 下 F0 已有的库（同名不论版本）
-    # 只保留 F1 独有库（F0 里没有的）
+    # 删除 F1 中 F0 也有的同名库以节省空间
+    # 但保留 NDK/HAL 后端库（android.hardware.*.so, *-ndk.so, libbinder_ndk.so）
+    # 因为这些是 API 版本特定的，F0 的 API 35 版与 API 36 二进制不兼容
     f0_lib64 = f'{f0d}/system/lib64'
     f1_lib64 = f'{f1d}/system/lib64'
     deleted_ct = 0
     deleted_sz = 0
     kept_ct = 0
     kept_sz = 0
+    def _is_api_specific(lib):
+        return (lib.startswith('android.hardware.')
+                or lib.endswith('-ndk.so')
+                or lib == 'libbinder_ndk.so')
     if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
         f0_map = {}
         for lib in os.listdir(f0_lib64):
@@ -179,7 +185,7 @@ def main():
             fp = os.path.join(f1_lib64, lib)
             if not os.path.isfile(fp) or os.path.islink(fp):
                 continue
-            if lib in f0_map:
+            if lib in f0_map and not _is_api_specific(lib):
                 sz = os.path.getsize(fp)
                 os.remove(fp)
                 deleted_ct += 1
@@ -190,6 +196,23 @@ def main():
                 kept_sz += sz
         print(f"  system/lib64/: kept {kept_ct} unique ({kept_sz/1024/1024:.2f} MB), "
               f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
+
+    # 在 F1 init.rc 中添加 setenv LD_LIBRARY_PATH
+    # dmesg 显示 /init.recovery.service.rc 先被解析，它的 service recovery 才是生效的
+    # /system/etc/init/hw/init.rc 的重复定义被 ignore，所以两个都要加
+    for irc_rel in ['init.recovery.service.rc', 'system/etc/init/hw/init.rc']:
+        irc = f'{f1d}/{irc_rel}'
+        if os.path.exists(irc):
+            with open(irc) as f:
+                c = f.read()
+            tag = 'service recovery /system/bin/recovery\n' \
+                  '    socket recovery stream 422 system system\n' \
+                  '    seclabel u:r:recovery:s0\n    user root'
+            if tag in c:
+                c = c.replace(tag, tag + '\n    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64')
+                with open(irc, 'w') as f:
+                    f.write(c)
+                print(f"  + setenv in F1 {irc_rel}")
 
     # 删 CI F1 system/bin/ 中非必要的工具（REF 只保留 26 个关键工具）
     bin_keep = {'recovery', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
@@ -235,12 +258,19 @@ def main():
                 for f in files:
                     src_f = os.path.join(root, f)
                     dst_f = os.path.join(f1d, rel, f)
-                    if not os.path.exists(dst_f):
-                        os.makedirs(os.path.dirname(dst_f), exist_ok=True)
-                        if os.path.islink(src_f):
-                            os.symlink(os.readlink(src_f), dst_f)
-                        else:
-                            shutil.copy2(src_f, dst_f, follow_symlinks=False)
+                    if os.path.exists(dst_f) or os.path.lexists(dst_f):
+                        continue
+                    # Ensure parent chain exists; remove any symlink in the
+                    # way that CI F1 uses as a mount-point placeholder
+                    parent = os.path.dirname(dst_f)
+                    if not os.path.isdir(parent):
+                        if os.path.lexists(parent):
+                            os.unlink(parent)
+                        os.makedirs(parent, exist_ok=True)
+                    if os.path.islink(src_f):
+                        os.symlink(os.readlink(src_f), dst_f)
+                    else:
+                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
 
         # 补 stock 的 system/bin/ 工具（CI 没有的）
         for f in ['touch_report_debug']:
@@ -249,6 +279,28 @@ def main():
             if os.path.exists(src) and not os.path.lexists(dst):
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst, follow_symlinks=False)
+
+        # 补 recovery 二进制 NEEDED 但 CI F1 缺失的库（如 libresetprop.so）
+        f1_lib64 = f'{f1d}/system/lib64'
+        needed = subprocess.run(
+            ['aarch64-linux-gnu-readelf', '-d', f'{f1d}/system/bin/recovery'],
+            capture_output=True, timeout=15, text=True)
+        missing_libs = []
+        for line in needed.stdout.split('\n'):
+            if 'NEEDED' not in line:
+                continue
+            lib = line.split('[')[1].split(']')[0]
+            lib_path = f'{f1_lib64}/{lib}'
+            if not os.path.exists(lib_path):
+                # Try stock F1
+                stk_lib = f'{stk1d}/system/lib64/{lib}'
+                if os.path.exists(stk_lib):
+                    os.makedirs(f1_lib64, exist_ok=True)
+                    shutil.copy2(stk_lib, lib_path, follow_symlinks=False)
+                    missing_libs.append(lib)
+                    print(f"  + missing lib from stock F1: {lib}")
+                else:
+                    print(f"  WARNING: {lib} not found in stock F1 either!")
 
         shutil.rmtree(stk1d)
         print(f"  + stock infrastructure (first_stage_ramdisk, modules, odm, vintf)")
