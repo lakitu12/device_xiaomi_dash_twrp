@@ -19,7 +19,7 @@ def align(v, a):
     return (v + a - 1) // a * a
 
 def get_frags(img_path):
-    """解析 vendor_boot。支持 MTK 双 fragment（表在 header 内）和标准单 ramdisk 格式。"""
+    """解析 vendor_boot。fragment 表在 DTB 之后的数据区（不在 header 内）。"""
     d = open(img_path, 'rb').read()
     page0 = d[:PAGE_SIZE]
     hs = struct.unpack_from('<I', page0, HS_OFF)[0]   # 2128
@@ -28,27 +28,30 @@ def get_frags(img_path):
     ro = align(hs, PAGE_SIZE)                           # 4096
     dtbo = align(ro + rs, PAGE_SIZE)
 
-    # 尝试 MTK fragment 表
-    tbl_off = struct.unpack_from('<I', page0, TBL_OFF)[0]
+    # fragment 表在数据区（DTB 之后 page 对齐处），不在 header 内
+    # header 的 tbl_off=216 实际是 table size（ec*es）
     ec = struct.unpack_from('<I', page0, TBL_OFF + 4)[0]
     es = struct.unpack_from('<I', page0, TBL_OFF + 8)[0]
+    tblo = align(dtbo + ds, PAGE_SIZE)
 
     frags = []
     has_valid_entries = False
     for i in range(ec):
-        eo = tbl_off + i * es
-        sz = struct.unpack_from('<I', page0, eo)[0]
-        off = struct.unpack_from('<I', page0, eo + 4)[0]
-        typ = struct.unpack_from('<I', page0, eo + 8)[0]
-        name = page0[eo + 12:eo + 44].rstrip(b'\x00').decode()
-        if sz > 0:
+        eo = tblo + i * es
+        if eo + 44 > len(d):
+            break
+        sz = struct.unpack_from('<I', d, eo)[0]
+        off = struct.unpack_from('<I', d, eo + 4)[0]
+        typ = struct.unpack_from('<I', d, eo + 8)[0]
+        name = d[eo + 12:eo + 44].rstrip(b'\x00').decode()
+        if sz > 0 and ro + off + sz <= len(d):
             has_valid_entries = True
             payload = d[ro + off:ro + off + sz]
         else:
             payload = b''
         frags.append({'size': sz, 'offset': off, 'type': typ, 'name': name, 'payload': payload})
 
-    # 标准格式（无有效 MTK fragment）：整个 ramdisk 作为 F0
+    # 标准格式（数据区无有效 entry）：整个 ramdisk 作为 F0
     if not has_valid_entries and rs > 0:
         payload = d[ro:ro + rs]
         frags = [{'size': rs, 'offset': 0, 'type': 1, 'name': '', 'payload': payload}]
