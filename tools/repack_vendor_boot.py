@@ -5,8 +5,7 @@ Replace recovery fragment in a vendor_boot v4 image for dash (Redmi Turbo 5 Max)
 Usage:
     python3 tools/repack_vendor_boot.py \\
         --template /path/to/dash-twrp16-v1.0.0-rc1-vendor_boot.img \\
-        --fragment /path/to/recovery-only-fragment.lz4 \\
-        --output /tmp/dash-FINAL.img
+        --fragment /path/to/recovery-only-fragment.lz4
 
 The template image (rc1) has a custom vendor ramdisk with system/lib64/twrp16/
 library directory that API-36 recovery needs. The script replaces only fragment 1
