@@ -55,8 +55,7 @@ CI 只编译了 recovery binary，vendor ramdisk 必须用 **rc1 模板**（含 
 ```bash
 python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
     --template dash-twrp16-v1.0.0-rc1-vendor_boot.img \
-    --fragment twrp-fragment.lz4 \
-    --output /tmp/dash-FINAL.img
+    --fragment twrp-fragment.lz4
 ```
 
 ### 参数
