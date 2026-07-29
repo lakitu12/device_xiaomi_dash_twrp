@@ -92,7 +92,7 @@ TW_USE_DMCTL := true
 TW_SKIP_FBE_DEFAULT_PASSWORD := true
 
 # TWRP version suffix shown in About page (e.g. "3.7.1_16-lakitu")
-TW_DEVICE_VERSION := lakitu
+TW_DEVICE_VERSION := dash | lakitu
 
 # Include extra language packs (zh_CN, zh_TW, ja, lk available in Settings)
 TW_EXTRA_LANGUAGES := true
