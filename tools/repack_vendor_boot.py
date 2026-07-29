@@ -160,36 +160,10 @@ def main():
     print(f"  base: CI F1 ({len(ci['frags'][1]['payload'])/1024/1024:.2f} MB LZ4)")
 
     # 删 CI F1 中 system/lib64/ 下 F0 已有的库（同名不论版本）
-    # 只保留 F1 独有库（F0 里没有的）
-    f0_lib64 = f'{f0d}/system/lib64'
+    # F1 的 system/lib64/ 全部保留——F0 版本是 API 35，F1 是 API 36
+    # 删掉 F1 的库会导致 init/recovery 用错 API 版本，linker 崩溃
     f1_lib64 = f'{f1d}/system/lib64'
-    deleted_ct = 0
-    deleted_sz = 0
-    kept_ct = 0
-    kept_sz = 0
-    if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
-        f0_map = {}
-        for lib in os.listdir(f0_lib64):
-            fp = os.path.join(f0_lib64, lib)
-            if os.path.isfile(fp) and not os.path.islink(fp):
-                f0_map[lib] = os.path.getsize(fp)
-        for lib in list(os.listdir(f1_lib64)):
-            if lib == 'twrp16':
-                continue
-            fp = os.path.join(f1_lib64, lib)
-            if not os.path.isfile(fp) or os.path.islink(fp):
-                continue
-            if lib in f0_map:
-                sz = os.path.getsize(fp)
-                os.remove(fp)
-                deleted_ct += 1
-                deleted_sz += sz
-            else:
-                sz = os.path.getsize(fp)
-                kept_ct += 1
-                kept_sz += sz
-        print(f"  system/lib64/: kept {kept_ct} unique ({kept_sz/1024/1024:.2f} MB), "
-              f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
+    print(f"  system/lib64/: kept {len(os.listdir(f1_lib64))} CI libs (no dedup - API 36 required)")
 
     # 删 CI F1 system/bin/ 中非必要的工具（REF 只保留 26 个关键工具）
     bin_keep = {'recovery', 'dmctl', 'e2fsck', 'minadbd', 'sgdisk', 'awk', 'bc',
@@ -264,6 +238,48 @@ def main():
                 os.symlink(os.readlink(src), dst)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
+
+    # 补 libresetprop.so（CI 构建缺失）
+    rp_dst = f'{f1d}/system/lib64/libresetprop.so'
+    if not os.path.exists(rp_dst):
+        # Fallback: extract from rc1 template if available
+        rc1_path = '/home/lakitu/下载/dash-twrp16-v1.0.0-rc1-vendor_boot.img'
+        if os.path.exists(rc1_path):
+            try:
+                rci = open(rc1_path, 'rb').read()
+                if rci[:8] == b'VNDRBOOT':
+                    rs_i = struct.unpack_from('<I', rci, 24)[0]
+                    ds_i = struct.unpack_from('<I', rci, 2100)[0]
+                    es_i = struct.unpack_from('<I', rci, 2112 + 8)[0]
+                    ro_i = align(align(2128, 4096), 4096)
+                    dtbo_i = align(ro_i + rs_i, 4096)
+                    tblo_i = align(dtbo_i + align(ds_i, 4096), 4096)
+                    eo_i = tblo_i + 1 * es_i
+                    sz_i, off_i, _ = struct.unpack_from('<III', rci, eo_i)
+                    import tempfile as _tf
+                    td = _tf.mkdtemp()
+                    open(f'{td}/_t.lz4', 'wb').write(rci[ro_i+off_i:ro_i+off_i+sz_i])
+                    subprocess.run(['lz4', '-d', f'{td}/_t.lz4', f'{td}/_t.cpio'], capture_output=True, timeout=10)
+                    subprocess.run(['cpio', '-idm'], input=open(f'{td}/_t.cpio','rb').read(), cwd=td, capture_output=True, timeout=10)
+                    src = f'{td}/system/lib64/libresetprop.so'
+                    if os.path.exists(src):
+                        shutil.copy2(src, rp_dst, follow_symlinks=False)
+                        print(f"  + libresetprop.so (from rc1 template)")
+                    shutil.rmtree(td)
+            except Exception:
+                pass
+
+    # F1 init 文件加 setenv（确保 recovery 能找到 twrp16/）
+    for rc_path in [f'{f1d}/init.recovery.service.rc', f'{f1d}/system/etc/init/hw/init.rc']:
+        if os.path.exists(rc_path):
+            with open(rc_path) as f:
+                c = f.read()
+            tag = 'service recovery /system/bin/recovery\n    socket recovery stream 422 system system\n    seclabel u:r:recovery:s0\n    user root'
+            if tag in c and 'setenv' not in c:
+                c = c.replace(tag, tag + '\n    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64')
+                with open(rc_path, 'w') as f:
+                    f.write(c)
+                print(f"  + setenv in {os.path.basename(rc_path)}")
 
     f1 = pack_lz4(f1d, '/tmp/rf1.lz4')
     print(f"  F1: {len(f1)/1024/1024:.2f} MB LZ4")
