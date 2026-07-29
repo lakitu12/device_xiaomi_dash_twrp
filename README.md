@@ -48,23 +48,66 @@ lz4 -l -12 --favor-decSpeed /tmp/twrp.cpio /tmp/twrp-fragment.lz4
 
 ## 重打包
 
-流程：原厂 `vendor_boot.img` → 改造 vendor ramdisk（rc1 风格）→ 制作 CJK recovery ramdisk → 重打包。
+流程：原厂 `vendor_boot.img` → 改造 vendor ramdisk → 裁剪 CI recovery + 加 CJK → 重打包。
 
 ### 0. 准备材料
 
 | 材料 | 说明 | 来源 |
 |------|------|------|
 | 原厂 `vendor_boot.img` | 设备原始 vendor_boot 分区备份 | `adb pull /dev/block/by-name/vendor_boot` |
-| CI 构建产物 | CI 输出的 `vendor_boot.img`（fragment 0 为空） | GitHub Actions |
-| rc1 premade recovery | rc1 的 TWRP recovery ramdisk（80 库的轻量基） | 设备树预编译目录 |
+| CI 构建产物 | CI 输出的 `vendor_boot.img`（fragment 0 为空，fragment 1 为自包含 recovery） | GitHub Actions |
 
-### 1. 提取 CI recovery fragment
+### 1. 改造 vendor ramdisk
+
+从原厂 vendor ramdisk 出发，只做 4 处修改：
 
 ```bash
+# 提取原厂 vendor ramdisk（fragment 0）
 python3 << 'EOF'
 import struct
 def align(v,a): return (v+a-1)//a*a
-ci=open('vendor_boot.img','rb').read()
+img=open('stock_vendor_boot.img','rb').read()
+hs,ds=struct.unpack_from('<II',img,2096)
+_,ec,es,_=struct.unpack_from('<IIII',img,2112)
+rs=struct.unpack_from('<I',img,24)[0]
+ro=align(hs,4096); dtbo=align(ro+rs,4096); tblo=align(dtbo+align(ds,4096),4096)
+eo=tblo+0*es; sz,off,_=struct.unpack_from('<III',img,eo)
+open('stock-vendor-frag.lz4','wb').write(img[ro+off:ro+off+sz])
+EOF
+
+# 解压
+lz4 -d stock-vendor-frag.lz4 /dev/stdout | cpio -id
+
+# 修改 1：删除原厂 recovery binary（TWRP 接管）
+rm -f system/bin/recovery
+
+# 修改 2：删除 res/（MIUI 恢复 UI，TWRP 不需要）
+rm -rf res/
+
+# 修改 3：添加 twrp16/ 兼容库（从 CI 构建的 recovery 中提取 API 36 版本）
+mkdir -p system/lib64/twrp16
+# 需要 9 个库（参见下方兼容层原理章节）
+
+# 修改 4：init.rc 在 service recovery 内部添加 setenv
+# service recovery /system/bin/recovery
+#     socket recovery stream 422 system system
+#     seclabel u:r:recovery:s0
+#     user root
+#     setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
+
+# 重新压缩
+find . | cpio -o -H newc > /tmp/vendor-mod.cpio
+lz4 -l -9 /tmp/vendor-mod.cpio /tmp/vendor-mod.lz4
+```
+
+### 2. 提取并裁剪 CI recovery
+
+```bash
+# 从 CI 产物提取 fragment 1
+python3 << 'EOF'
+import struct
+def align(v,a): return (v+a-1)//a*a
+ci=open('ci_vendor_boot.img','rb').read()
 hs,ds=struct.unpack_from('<II',ci,2096)
 _,ec,es,_=struct.unpack_from('<IIII',ci,2112)
 rs=struct.unpack_from('<I',ci,24)[0]
@@ -72,87 +115,38 @@ ro=align(hs,4096); dtbo=align(ro+rs,4096); tblo=align(dtbo+align(ds,4096),4096)
 eo=tblo+1*es; sz,off,_=struct.unpack_from('<III',ci,eo)
 open('ci-recovery.lz4','wb').write(ci[ro+off:ro+off+sz])
 EOF
-```
 
-### 2. 制作 CJK recovery ramdisk
+# 解压
+lz4 -d ci-recovery.lz4 /dev/stdout | cpio -id
 
-以 rc1 recovery ramdisk 为基，只做最小改动：
+# 删除 vendor 已提供的核心组件
+rm -f system/bin/init system/bin/linker64 system/bin/adbd
+rm -f system/bin/fastbootd system/bin/toybox
 
-```bash
-# 解压 rc1 recovery 为基
-lz4 -d rc1-recovery.lz4 /dev/stdout | cpio -id
+# 删除与 vendor 完全相同的库（同名同大小，vendor 已提供 API 35 版本）
+# twrp16/ 兼容库处理 ABI 差异
 
-# 替换 CI 编译的 recovery binary
-cp ci-recovery-root/system/bin/recovery system/bin/recovery
-
-# 添加中文字体和 23 种语言
-cp ci-recovery-root/twres/fonts/NotoSansCJKsc-Regular.ttf twres/fonts/
-cp ci-recovery-root/twres/languages/*.xml twres/languages/
-
-# 保留 stock-vendor-hal/（keymint/gatekeeper/weaver 服务依赖）
-# 删除重复工具（vendor 已提供）
-rm -f system/bin/fastbootd
+# 添加 CJK 字体和全部 23 种语言（保留 stock-vendor-hal/ 目录）
+# 参见下方"语言支持"和"兼容层原理"章节
 
 # LZ4 压缩
 find . | cpio -o -H newc > /tmp/twrp.cpio
 lz4 -l -9 /tmp/twrp.cpio /tmp/twrp-cjk.lz4
 ```
 
-### 3. 改造 vendor ramdisk（rc1 风格）
-
-从原厂 vendor ramdisk 出发，只做三处修改：
+### 3. 重打包
 
 ```bash
-# 解压原厂 vendor ramdisk
-lz4 -d stock-vendor-frag.lz4 /dev/stdout | cpio -id
-
-# 修改 1：删除原厂 recovery binary（TWRP 替代）
-rm -f system/bin/recovery
-
-# 修改 2：删除 res/（MIUI 恢复 UI，TWRP 不需要）
-rm -rf res/
-
-# 修改 3：添加 twrp16/ 兼容库
-mkdir -p system/lib64/twrp16
-# 从 CI 或 rc1 中复制 9 个 API 36 系统库：
-# libbase.so libbootloader_message.so libc++.so libcutils.so
-# libfs_mgr.so liblog.so liblp.so libprotobuf-cpp-lite.so libutils.so
-
-# 修改 4：init.rc 在 service recovery 内部添加 setenv
-# 找到 service recovery 定义，在 user root 后添加：
-#     setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
-
-# LZ4 压缩
-find . | cpio -o -H newc > /tmp/vendor-mod.cpio
-lz4 -l -9 /tmp/vendor-mod.cpio /tmp/vendor-mod.lz4
-```
-
-### 4. 重打包为 vendor_boot
-
-```bash
-# 用修改后的 vendor ramdisk 和 CJK recovery 手动构建
-python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
-    --template /path/to/stock/vendor_boot.img \
+python3 tools/repack_vendor_boot.py \
+    --template /path/to/stock_vendor_boot.img \
     --fragment /tmp/twrp-cjk.lz4 \
     --output dash-CJK-vendor_boot.img
 ```
 
-但这里有个问题——`repack_vendor_boot.py` 会保留 fragment 0（vendor ramdisk）原样。所以需要先准备好一个**已改造好 vendor ramdisk 的 template**，或者分两步：
+> `repack_vendor_boot.py` 保留 template 的 fragment 0（此时需已改造好 vendor ramdisk）。
+> 实际操作中可将改造后的 vendor ramdisk 合并为一个新的 template image，或直接修改 repack 脚本。
 
-**方法 A（推荐）：用 rc1 template 作为基**
-rc1 已经包含了 vendor ramdisk 的改造。直接用 repack 脚本替换 recovery 即可：
-
-```bash
-python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
-    --template dash-twrp16-v1.0.0-rc1-vendor_boot.img \
-    --fragment /tmp/twrp-cjk.lz4 \
-    --output dash-CJK-vendor_boot.img
-```
-
-**方法 B（从零开始）：改造原厂 vendor ramdisk 后手动打包**
-先用步骤 3 改造 vendor ramdisk，然后手动构建 vendor_boot（参考 `repack_vendor_boot.py` 源码）。
-
-### 5. 刷入
+### 4. 刷入
 
 ```bash
 adb reboot bootloader
@@ -162,25 +156,26 @@ fastboot reboot
 
 刷前备份原厂 vendor_boot。dash 是 VAB 结构，`vendor_boot` 分槽位，刷前确认活动槽。
 
-### rc1 template 的兼容层原理
+### 兼容层原理
 
-rc1 template 的 vendor ramdisk 基于原厂做了两处修改，使得 API 36 编译的 recovery 能在 API 35 的 vendor 环境中运行：
+API 36 编译的 TWRP recovery 需要与 API 35 的 vendor 分区服务通信。解决方式是在 vendor ramdisk 中增加两处修改：
 
-1. **`system/etc/init/hw/init.rc`** — 在 `service recovery` 内部添加：
+1. **`system/etc/init/hw/init.rc`** — 在 `service recovery` 内部添加（必须放在服务内部而非全局）：
    ```
    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
    ```
-   （**必须**放在 service 内部而非全局 `on boot`，否则影响其他服务）
 
 2. **新增 `system/lib64/twrp16/`**，放入 9 个 API 36 系统库：
    `libbase.so`、`libbootloader_message.so`、`libc++.so`、`libcutils.so`、`libfs_mgr.so`、`liblog.so`、`liblp.so`、`libprotobuf-cpp-lite.so`、`libutils.so`
+
+   linker 加载 recovery binary 时优先搜索 `twrp16/`，找到这 9 个有 ABI break 的库；其余库回退到 vendor 的 API 35 版本。
 
 ### 最终镜像结构
 
 | 片段 | 内容 | 典型大小 |
 |------|------|----------|
-| Fragment 0 | **vendor ramdisk**（rc1 风格：删原厂 recovery + res/ + 加 twrp16/ + init.rc setenv） | ~34 MB |
-| Fragment 1 | **TWRP recovery**（rc1 基 + CI binary + CJK 字体 + 23 语言 + stock-vendor-hal） | ~19 MB |
+| Fragment 0 | **vendor ramdisk**（删 recovery + res/ + 加 twrp16/ + init.rc setenv） | ~34 MB |
+| Fragment 1 | **TWRP recovery**（CI 基 + CJK 字体 + 23 语言 + stock-vendor-hal） | ~19 MB |
 | **已用** | | **~53 MB / 64 MB** |
 
 ### 关键注意事项
