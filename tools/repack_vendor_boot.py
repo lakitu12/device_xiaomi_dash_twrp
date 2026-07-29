@@ -193,9 +193,15 @@ def main():
               f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
 
     # 删 CI F1 中多余的 init 服务定义和 binary（F0 已有原厂版本）
-    for rc in ['keystore2.rc','servicemanager.rc','hwservicemanager.rc','vndservicemanager.rc']:
-        p = f'{f1d}/system/etc/init/{rc}'
-        if os.path.exists(p): os.remove(p)
+    for rc in ['keystore2.rc','servicemanager.rc','hwservicemanager.rc','vndservicemanager.rc',
+               'init.recovery.service.rc','init.recovery.hlthchrg.rc','init.recovery.ldconfig.rc']:
+        # Check both system/etc/init/ and root
+        for base in [f'{f1d}/system/etc/init', f'{f1d}']:
+            p = f'{base}/{rc}'
+            if os.path.exists(p):
+                os.remove(p)
+                if 'init.recovery' in rc:
+                    print(f"  removed {rc}")
     for b in ['keystore2','keystore_cli_v2','servicemanager','hwservicemanager','vndservicemanager','fscryptpolicyget']:
         p = f'{f1d}/system/bin/{b}'
         if os.path.exists(p): os.remove(p)
