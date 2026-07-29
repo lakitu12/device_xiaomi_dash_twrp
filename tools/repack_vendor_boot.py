@@ -66,7 +66,7 @@ def main():
     parser = argparse.ArgumentParser(description="Repack vendor_boot v4 with new recovery fragment")
     parser.add_argument("--template", required=True, help="rc1 template vendor_boot image")
     parser.add_argument("--fragment", required=True, help="new recovery fragment (LZ4 cpio)")
-    parser.add_argument("--output", default="/tmp/dash-FINAL.img", help="output image path")
+    parser.add_argument("--output", default="/tmp/dash-UNTESTED-vendor_boot.img", help="output image path")
     args = parser.parse_args()
 
     # Load template

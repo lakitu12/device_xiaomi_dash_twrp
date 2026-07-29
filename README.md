@@ -65,7 +65,7 @@ python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
 |------|------|
 | `--template` | rc1 模板 vendor_boot（提供含 `twrp16/` 库的 vendor ramdisk） |
 | `--fragment` | 新 recovery fragment（LZ4 压缩的 cpio） |
-| `--output` | 输出路径，默认 `/tmp/dash-FINAL.img` |
+| `--output` | 输出路径，默认 `/tmp/dash-UNTESTED-vendor_boot.img` |
 
 脚本工作原理：解析 v4 header，保留 fragment 0（vendor ramdisk），替换 fragment 1（recovery），填充到 64MB 分区大小，拷贝 AVB footer。
 
@@ -87,27 +87,11 @@ linker 加载 recovery binary 时优先搜索 `twrp16/`，找到这 9 个有 ABI
 
 ```bash
 adb reboot bootloader
-fastboot flash vendor_boot /tmp/dash-FINAL.img
+fastboot flash vendor_boot /tmp/dash-UNTESTED-vendor_boot.img
 fastboot reboot
 ```
 
 刷前备份原厂 vendor_boot。dash 是 VAB 结构，`vendor_boot` 分槽位，刷前确认活动槽。
-
----
-
-## 本地构建
-
-```bash
-cd source-twrp16
-source build/envsetup.sh
-lunch twrp_dash-bp2a-eng
-# 或使用 local_manifest.xml 同步所有依赖
-mkdir -p .repo/local_manifests
-cp device/xiaomi/dash/local_manifest.xml .repo/local_manifests/dash.xml
-repo sync
-
-SOONG_GOMEMLIMIT=8GiB SOONG_GOGC=20 m recovery vendorbootimage -j4
-```
 
 ---
 
