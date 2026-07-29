@@ -1,0 +1,11 @@
+# Device node permissions for dash (MT6991) recovery
+# These supplement the platform defaults from system/core/init/ueventd.rc
+
+# Touchscreen device
+/dev/xiaomi-touch              0660   root     input
+
+# TouchSense haptic driver (Immersion TSPDRV)
+/dev/tspdrv                     0666   root     root
+
+# Vibrator PWM device
+/dev/vibrator                   0666   root     root

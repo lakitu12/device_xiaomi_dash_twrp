@@ -19,10 +19,13 @@ service dash-touch-bridge /system/bin/touch_report_debug
     # permanently inert.
     setenv LD_LIBRARY_PATH /odm/lib64:/system/lib64
 
-# Load the device-exact vendor_dlkm touchscreen pair after platform modules.
+# Load kernel modules — touchscreen first, then USB storage for OTG.
 on init
     insmod /lib/modules/xiaomi_touch_dash.ko
     insmod /lib/modules/nt38771_touch_dash.ko
+    # USB mass-storage for OTG support (built-in or module)
+    insmod /lib/modules/usb-storage.ko
+    insmod /lib/modules/uas.ko
 
 # Module probing and ueventd publish the character node asynchronously, so
 # wait for the node before starting the host-touch loop. A wait timeout only
@@ -32,4 +35,12 @@ on boot
     wait /dev/xiaomi-touch 10
     chown root input /dev/xiaomi-touch
     chmod 0660 /dev/xiaomi-touch
+    # Set sysfs permissions for haptic feedback (vibration)
+    # TWRP writes to timed_output or LED-class vibrator nodes on touch events.
+    chown root root /sys/class/timed_output/vibrator/enable
+    chmod 0666 /sys/class/timed_output/vibrator/enable
+    chown root root /sys/class/leds/vibrator/duration
+    chmod 0666 /sys/class/leds/vibrator/duration
+    chown root root /sys/class/leds/vibrator/activate
+    chmod 0666 /sys/class/leds/vibrator/activate
     start dash-touch-bridge

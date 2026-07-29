@@ -213,10 +213,46 @@ TWRP Settings → Language 中可选简体中文、繁体中文、日语等。�
 
 - MTP 传输 >4GiB 时 PC 端可能卡死；请用 `adb push`
 - `adb sideload` 完成后 recovery 可能卡在 sideload 页面
-- 震动 / 截图 / OTG 未适配
+- 截图功能依赖于 TWRP 内建 `gr_save_screenshot()`（使用 libminuitwrp 的 graphics_utils），理论上在 DRM 模式下也可工作——尚未完全验证
 - `/cache` 实际指向小米的 `rescue` 分区（显示为 "Cache (Rescue)"），`wipeduringfactoryreset=0` 排除 Factory Reset，但手动 Wipe Cache 仍会清除
 
-## 内部存储
+## 适配状态
+
+### 震动（Haptic / Vibration）
+
+TWRP 默认开启震动 (`TW_NO_HAPTICS` 未定义)。`minuitwrp/events.cpp` 中的 `vibrate()` 函数按以下优先级尝试：
+
+1. `/sys/class/leds/vibrator/activate` → 写入 duration + activate=1
+2. `/sys/class/timed_output/vibrator/enable` → 写入 timeout_ms
+
+`init.recovery.project.rc` 在 `on boot` 阶段对上述两个路径执行 `chmod 0666` + `chown root root`，确保 TWRP 进程可写入。
+
+若内核 vibrator 驱动（`timed_output` 或 `leds` 类）未加载或 sysfs 节点不存在，震动能正常编译但运行时静默失败。可在 TWRP 中执行 `ls /sys/class/timed_output/` 或 `ls /sys/class/leds/vibrator/` 检查。
+
+已知 Kernel 6.6 已移除 `timed_output` 类驱动（upstream 删除），MTK 可能通过 `leds` 类或自定义 PWM 路径提供震动。若两个标准路径都不存在，需通过内核 config 或 DT 确认正确的 vibrator sysfs 路径。
+
+### 截图（Screenshot）
+
+TWRP 使用内建的 `gr_save_screenshot()` (在 `minuitwrp/graphics_utils.cpp` 中)，从 TWRP 的内存绘图表面 (`gr_mem_surface`) 读取像素数据，通过 `libpng` 编码为 PNG。此功能不依赖 `/dev/graphics/fb0`，因此 DRM-only 设备也可使用。
+
+截图按钮在 `Settings → Screenshot` 菜单下，保存到 `/data/media/0/Pictures/Screenshots/`。Build 中已链接 `libpng`。
+
+### OTG
+
+`recovery.fstab` 已配置 USB 控制器路径：
+```
+/devices/platform/soc/16701000.usb0/16700000.xhci* auto auto defaults voldmanaged=usbotg:auto,storage,removable,storagename=USB-OTG
+```
+
+USB 控制器为 `16701000.usb0`（MT6991 的 dwc3 控制器），xHCI 主机在 `16700000.xhci`。
+
+`init.recovery.mt6991.rc` 在 `on boot` 阶段尝试设置 OTG 模式。`init.recovery.project.rc` 在 `on init` 阶段尝试加载 `usb-storage.ko` 和 `uas.ko`（如果内核已将 USB Storage 编入则静默忽略）。
+
+需要 USB 大容量存储设备接入后，TWRP PartitionManager 通过 vold 自动检测并挂载到 `/usb-otg`（或 `voldmanaged` 指定的路径）。
+
+> 注意：OTG 需要内核支持 USB 主机模式和 `CONFIG_USB_STORAGE`（或其模块）。若 dash 内核使用 GKI + vendor_dlkm，USB 存储模块可能在 `vendor_dlkm` 分区中，recovery 默认不会挂载该分区加载模块。`insmod` 命令仅当模块实际存在于 `/lib/modules/` 时生效。
+
+### 内部存储
 
 使用 `/data/media/0`。recovery 运行时不保留 `/sdcard` 作为内部存储别名。
 
