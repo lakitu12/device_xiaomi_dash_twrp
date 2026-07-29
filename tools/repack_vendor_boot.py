@@ -149,10 +149,15 @@ def main():
             os.remove(p)
             print(f"  removed {os.path.basename(rel)}")
 
-    # 删同名库（保留 NDK/HAL 保护集）
+    # 删同名库，但保护 API 版本特定的库（NDK/HAL 后端 + libbinder/libbinder_ndk）
     f0_lib64 = f'{f0d}/system/lib64'
     f1_lib64 = f'{f1d}/system/lib64'
     del_ct = 0; del_sz = 0; keep_ct = 0; keep_sz = 0
+    f0_libs = set()
+    def _protected_lib(lib):
+        return (lib.startswith('android.hardware.')
+                or lib.endswith('-ndk.so')
+                or lib in ('libbinder_ndk.so', 'libbinder.so'))
     if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
         f0_libs = {lib for lib in os.listdir(f0_lib64)
                    if os.path.isfile(os.path.join(f0_lib64, lib))
@@ -163,7 +168,7 @@ def main():
             fp = os.path.join(f1_lib64, lib)
             if not os.path.isfile(fp) or os.path.islink(fp):
                 continue
-            if lib in f0_libs:
+            if lib in f0_libs and not _protected_lib(lib):
                 sz = os.path.getsize(fp)
                 os.remove(fp)
                 del_ct += 1; del_sz += sz
@@ -198,6 +203,72 @@ def main():
                 os.symlink(os.readlink(src), dst)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
+
+    # 补 stock F1 基础设施（参考镜像包含这些）
+    # 原厂可能是单 ramdisk 格式或双 fragment。从有效的地方提取
+    stk_infra_src = '/tmp/rstk_infra'
+    if len(stk['frags']) > 1 and stk['frags'][1]['size'] > 0:
+        unpack_lz4(stk['frags'][1]['payload'], stk_infra_src)
+    elif stk['rs'] > 0:
+        # 单 ramdisk 格式：整个 ramdisk 包含基础设施
+        unpack_lz4(stk['stk'][stk['ro']:stk['ro'] + stk['rs']], stk_infra_src)
+    
+    if os.path.exists(stk_infra_src):
+        infra_dirs = [
+            'first_stage_ramdisk', 'lib/modules',
+            'odm/firmware', 'odm/lib64',
+            'system/etc/vintf/manifest',
+            'vendor/etc/vintf/manifest',
+            'system/lib64/stock-vendor-hal',
+            'system/bin/hw',
+            'system/etc/init',
+        ]
+        for dir_rel in infra_dirs:
+            src_d = os.path.join(stk_infra_src, dir_rel)
+            if not os.path.exists(src_d):
+                continue
+            for root, dirs, files in os.walk(src_d):
+                rel = os.path.relpath(root, stk_infra_src)
+                for f in files:
+                    src_f = os.path.join(root, f)
+                    dst_f = os.path.join(f1d, rel, f)
+                    if os.path.lexists(dst_f):
+                        continue
+                    parent = os.path.dirname(dst_f)
+                    if not os.path.isdir(parent):
+                        if os.path.lexists(parent):
+                            os.unlink(parent)
+                        os.makedirs(parent, exist_ok=True)
+                    if os.path.islink(src_f):
+                        os.symlink(os.readlink(src_f), dst_f)
+                    else:
+                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
+
+        # 补 recovery 二进制 NEEDED 但 F1 缺失且 F0/twrp16 也不提供的库
+        needed = subprocess.run(
+            ['aarch64-linux-gnu-readelf', '-d', f'{f1d}/system/bin/recovery'],
+            capture_output=True, timeout=15, text=True)
+        for line in needed.stdout.split('\n'):
+            if 'NEEDED' not in line:
+                continue
+            lib = line.split('[')[1].split(']')[0]
+            lib_path = os.path.join(f1d, 'system/lib64', lib)
+            if os.path.exists(lib_path):
+                continue  # 已在 F1 中
+            # 跳过在 twrp16/ 中的（可通过 LD_LIBRARY_PATH 找到）
+            twrp16_path = os.path.join(f1d, 'system/lib64/twrp16', lib)
+            if os.path.exists(twrp16_path):
+                continue
+            # 跳过在 F0 中的（可通过 LD_LIBRARY_PATH fallback 找到）
+            if lib in f0_libs:
+                continue
+            stk_lib = os.path.join(stk_infra_src, 'system/lib64', lib)
+            if os.path.exists(stk_lib):
+                os.makedirs(os.path.dirname(lib_path), exist_ok=True)
+                shutil.copy2(stk_lib, lib_path, follow_symlinks=False)
+                print(f"  + missing lib from stock: {lib}")
+
+        shutil.rmtree(stk_infra_src)
 
     f1_new = pack_lz4(f1d, '/tmp/rf1.lz4')
     print(f"  F1 new: {len(f1_new)/1024/1024:.2f} MB LZ4")
