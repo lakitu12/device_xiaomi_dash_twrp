@@ -159,33 +159,70 @@ def main():
     unpack_lz4(ci['frags'][1]['payload'], f1d)
     print(f"  base: CI F1 ({len(ci['frags'][1]['payload'])/1024/1024:.2f} MB LZ4)")
 
-    # 删 CI F1 中 system/lib64/ 下 F0 已有的库（同名不论版本）
-    # 删除 F1 中 F0 也有的同名库以节省空间
-    # 但保留 NDK/HAL 后端库（android.hardware.*.so, *-ndk.so, libbinder_ndk.so）
-    # 因为这些是 API 版本特定的，F0 的 API 35 版与 API 36 二进制不兼容
+    # 删 CI F1 中 system/lib64/ 下 F0 已有的同名库以节省空间
+    # 但保留 recovery 二进制传递依赖到的库（包括 NDK/HAL 后端及其传递依赖）
+    # 因为 F0 的 API 35 版与 API 36 二进制存在符号兼容问题
     f0_lib64 = f'{f0d}/system/lib64'
     f1_lib64 = f'{f1d}/system/lib64'
     deleted_ct = 0
     deleted_sz = 0
     kept_ct = 0
     kept_sz = 0
-    def _is_api_specific(lib):
-        return (lib.startswith('android.hardware.')
-                or lib.endswith('-ndk.so')
-                or lib == 'libbinder_ndk.so')
     if os.path.isdir(f0_lib64) and os.path.isdir(f1_lib64):
-        f0_map = {}
-        for lib in os.listdir(f0_lib64):
-            fp = os.path.join(f0_lib64, lib)
-            if os.path.isfile(fp) and not os.path.islink(fp):
-                f0_map[lib] = os.path.getsize(fp)
-        for lib in list(os.listdir(f1_lib64)):
-            if lib == 'twrp16':
-                continue
+
+        def _readelf_needed(libfile):
+            """return set of NEEDED libs from a shared library or binary"""
+            r = subprocess.run(
+                ['aarch64-linux-gnu-readelf', '-d', libfile],
+                capture_output=True, timeout=15, text=True)
+            result = set()
+            for line in r.stdout.split('\n'):
+                if 'NEEDED' in line:
+                    lib = line.split('[')[1].split(']')[0]
+                    result.add(lib)
+            return result
+
+        # Build set of all CI F1 libs
+        f1_all = set()
+        for lib in os.listdir(f1_lib64):
             fp = os.path.join(f1_lib64, lib)
-            if not os.path.isfile(fp) or os.path.islink(fp):
-                continue
-            if lib in f0_map and not _is_api_specific(lib):
+            if os.path.isfile(fp) and not os.path.islink(fp) and lib != 'twrp16':
+                f1_all.add(lib)
+
+        # Start with recovery binary's direct NEEDED deps that exist in F1 and F0
+        recovery_bin = os.path.join(f1d, 'system/bin/recovery')
+        protected = _readelf_needed(recovery_bin) & f1_all
+
+        # Add NDK/HAL backend patterns (API version specific)
+        for lib in f1_all:
+            if (lib.startswith('android.hardware.')
+                    or lib.endswith('-ndk.so')
+                    or lib == 'libbinder_ndk.so'):
+                protected.add(lib)
+
+        # Transitive closure: for each protected lib, protect its deps too
+        changed = True
+        while changed:
+            changed = False
+            for lib in list(protected):
+                libfile = os.path.join(f1_lib64, lib)
+                if not os.path.exists(libfile):
+                    continue
+                needed = _readelf_needed(libfile) & f1_all
+                for dep in needed:
+                    if dep not in protected:
+                        protected.add(dep)
+                        changed = True
+
+        # F0 libs map for dedup
+        f0_map = {lib: os.path.getsize(os.path.join(f0_lib64, lib))
+                  for lib in os.listdir(f0_lib64)
+                  if os.path.isfile(os.path.join(f0_lib64, lib))
+                  and not os.path.islink(os.path.join(f0_lib64, lib))}
+
+        for lib in list(f1_all):
+            fp = os.path.join(f1_lib64, lib)
+            if lib in f0_map and lib not in protected:
                 sz = os.path.getsize(fp)
                 os.remove(fp)
                 deleted_ct += 1
@@ -194,7 +231,7 @@ def main():
                 sz = os.path.getsize(fp)
                 kept_ct += 1
                 kept_sz += sz
-        print(f"  system/lib64/: kept {kept_ct} unique ({kept_sz/1024/1024:.2f} MB), "
+        print(f"  system/lib64/: kept {kept_ct} ({kept_sz/1024/1024:.2f} MB), "
               f"deleted {deleted_ct} (from F0, {deleted_sz/1024/1024:.2f} MB)")
 
     # 在 F1 init.rc 中添加 setenv LD_LIBRARY_PATH
