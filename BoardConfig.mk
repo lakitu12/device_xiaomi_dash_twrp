@@ -93,3 +93,8 @@ TW_SKIP_FBE_DEFAULT_PASSWORD := true
 
 # TWRP version suffix shown in About page (e.g. "3.7.1_16-lakitu")
 TW_DEVICE_VERSION := lakitu
+
+# Include extra language packs (Chinese, Japanese, Korean, etc.)
+TW_EXTRA_LANGUAGES := true
+# Default UI language: Simplified Chinese
+TW_DEFAULT_LANGUAGE := zh_CN
