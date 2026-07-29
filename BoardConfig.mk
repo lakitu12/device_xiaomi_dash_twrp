@@ -55,6 +55,9 @@ TW_BRIGHTNESS_PATH := "/sys/class/leds/lcd-backlight/brightness"
 TW_MAX_BRIGHTNESS := 16383
 TW_DEFAULT_BRIGHTNESS := 8192
 TW_USE_NEW_MINADBD := true
+
+# Use zstd compression for TWRP backups (faster than gzip, good compression ratio)
+TW_USE_ZSTD := true
 # Treat the primary data/media tree as the storage mount itself.  The explicit
 # RECOVERY_SDCARD_ON_DATA flag is required here because /data is also marked as
 # settingsstorage in recovery.fstab, which suppresses TWRP's auto-detection.
