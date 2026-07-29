@@ -84,15 +84,21 @@ rm -f system/bin/recovery
 # 修改 2：删除 res/（MIUI 恢复 UI，TWRP 不需要）
 rm -rf res/
 
-# 修改 3：添加 twrp16/ 兼容库（从 CI 构建的 recovery 中提取 API 36 版本）
+# 修改 3：添加 twrp16/ 兼容库
 mkdir -p system/lib64/twrp16
-# 需要 9 个库（参见下方兼容层原理章节）
+# twrp16/ 的 9 个库来自 CI recovery 的 system/lib64/
+# 它们是 API 36 版本的系统库，用于桥接 TWRP（API 36）与 vendor 分区（API 35）
+# 需要的库：
+#   libbase.so  libbootloader_message.so  libc++.so  libcutils.so
+#   libfs_mgr.so  liblog.so  liblp.so  libprotobuf-cpp-lite.so  libutils.so
+# 从 CI recovery ramdisk 中提取：
+#   lz4 -d ci-recovery.lz4 /dev/stdout | cpio -id
+#   cp system/lib64/{libbase.so,libbootloader_message.so,libc++.so,...} \
+#     /path/to/vendor-ramdisk/system/lib64/twrp16/
 
 # 修改 4：init.rc 在 service recovery 内部添加 setenv
-# service recovery /system/bin/recovery
-#     socket recovery stream 422 system system
-#     seclabel u:r:recovery:s0
-#     user root
+# init.rc 在原厂 vendor ramdisk 的 system/etc/init/hw/init.rc
+# 找到 service recovery 定义处，在 user root 后添加：
 #     setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
 
 # 重新压缩
@@ -160,13 +166,19 @@ fastboot reboot
 
 API 36 编译的 TWRP recovery 需要与 API 35 的 vendor 分区服务通信。解决方式是在 vendor ramdisk 中增加两处修改：
 
-1. **`system/etc/init/hw/init.rc`** — 在 `service recovery` 内部添加（必须放在服务内部而非全局）：
+1. **`system/etc/init/hw/init.rc`**（原厂 vendor ramdisk 自带）— 在 `service recovery` 内部添加一行（必须放在服务内部而非全局，否则影响其他服务的正常加载）：
    ```
    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
    ```
 
-2. **新增 `system/lib64/twrp16/`**，放入 9 个 API 36 系统库：
-   `libbase.so`、`libbootloader_message.so`、`libc++.so`、`libcutils.so`、`libfs_mgr.so`、`liblog.so`、`liblp.so`、`libprotobuf-cpp-lite.so`、`libutils.so`
+2. **新增 `system/lib64/twrp16/`** — 放入 9 个 API 36 系统库，从 CI recovery 的 `system/lib64/` 中提取：
+   ```
+   libbase.so              libbootloader_message.so
+   libc++.so               libcutils.so
+   libfs_mgr.so            liblog.so
+   liblp.so                libprotobuf-cpp-lite.so
+   libutils.so
+   ```
 
    linker 加载 recovery binary 时优先搜索 `twrp16/`，找到这 9 个有 ABI break 的库；其余库回退到 vendor 的 API 35 版本。
 
