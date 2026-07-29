@@ -97,11 +97,11 @@ TW_DEVICE_VERSION := dash | lakitu
 # Include extra language packs (zh_CN, zh_TW, ja, lk available in Settings)
 TW_EXTRA_LANGUAGES := true
 
-# Replace the 17.8 MB NotoSansCJKsc CJK font with WenQuanYi Micro Hei (4.4 MB,
-# 20 932 CJK glyphs) during recovery ramdisk assembly.
-# WenQuanYi Micro Hei (文泉驿微米黑) is an open-source, freely-licensed font
-# derived from Droid Sans Fallback, covering GB2312 and Big5 with full
-# Latin/Greek/Cyrillic/Hiragana/Katakana support — enough for any file name.
+# Replace the 17.8 MB NotoSansCJKsc CJK font with DroidSansFallback (3.6 MB,
+# 20 902 CJK glyphs) during recovery ramdisk assembly.
+# DroidSansFallback is the original Android CJK fallback font used from
+# Android 1.6 through 6.0 — small, well-tested, and covers the full GB2312
+# CJK range needed for any filename the file manager may encounter.
 BOARD_RECOVERY_IMAGE_PREPARE += \
     mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/twres/fonts && \
     cp -f $(DEVICE_PATH)/prebuilt/twres/fonts/NotoSansCJKsc-Regular.ttf \
