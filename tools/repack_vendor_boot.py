@@ -262,10 +262,24 @@ def main():
             print(f"  WARNING: could not find DTB region in stock")
 
     # fragment 表在 header（page0）内，从 tbl_off 开始
-    tbl_off = struct.unpack_from('<I', stk['page0'], TBL_OFF)[0]
-    # 设备使用单 ramdisk 模式（fragment 表全零），F0+F1 拼接为一个 ramdisk
-    # 不写入 fragment entries，保持全零（原厂和参考镜像都是零）
-    img[tbl_off:tbl_off + 2 * ENTRY_SIZE] = b'\x00' * (2 * ENTRY_SIZE)
+    # fragment 表在 DTB 之后 page 对齐的数据区（不在 header 内）
+    # header 的 tbl_off=216 实际是 table size（ec × es）
+    tbl_off_file = align(ds + stk['ds'], PAGE_SIZE)
+    e0 = bytearray(ENTRY_SIZE)
+    struct.pack_into('<I', e0, 0, len(f0))
+    struct.pack_into('<I', e0, 4, 0)
+    struct.pack_into('<I', e0, 8, 1)
+    e0[12:44] = b'\x00' * 32
+    img[tbl_off_file:tbl_off_file + ENTRY_SIZE] = e0
+
+    e1 = bytearray(ENTRY_SIZE)
+    struct.pack_into('<I', e1, 0, len(f1))
+    struct.pack_into('<I', e1, 4, len(f0))
+    struct.pack_into('<I', e1, 8, 2)
+    e1[12:44] = b'\x00' * 32
+    img[tbl_off_file + ENTRY_SIZE:tbl_off_file + 2 * ENTRY_SIZE] = e1
+
+    # header 字段保持原样（tbl_off=216 是 table size，不是偏移）
 
     with open(args.output, 'wb') as f:
         f.write(bytes(img))
