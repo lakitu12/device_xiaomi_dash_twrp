@@ -50,13 +50,17 @@ def parse_vendor_boot(image):
         "page_size": page_size,
         "header_size": header_size,
         "ramdisk_size": ramdisk_size,
+        "ramdisk_offset": ramdisk_offset,
         "dtb_size": dtb_size,
+        "dtb_offset": dtb_offset,
+        "dtb_end": dtb_end,
         "table_size": table_size,
         "table_offset": table_offset,
         "entry_count": entry_count,
         "entry_size": entry_size,
         "bootconfig_size": bootconfig_size,
         "entries": entries,
+        "bootconfig_end": table_offset,
         "avb_footer": image[-4096:] if image[-8:-4] == b"AVBf" else None,
     }
 

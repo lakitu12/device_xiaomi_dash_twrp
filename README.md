@@ -72,7 +72,7 @@ python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
 
 rc1 在 vendor ramdisk（fragment 0）中修改了两处，使得 API 36 编译的 recovery 能在 API 35 的 vendor 环境中运行：
 
-1. **`system/etc/init/hw/init.rc`** 添加：
+1. **`system/etc/init/hw/init.rc`** 在 `service recovery` 内部添加：
    ```
    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
    ```
@@ -82,15 +82,83 @@ rc1 在 vendor ramdisk（fragment 0）中修改了两处，使得 API 36 编译�
 
 linker 加载 recovery binary 时优先搜索 `twrp16/`，找到这 9 个有 ABI break 的库；其余库回退到系统的 API 35 版本。
 
-### 刷入
+### 完整打包流程（从 CI 产物到可刷写镜像）
 
-```bash
-adb reboot bootloader
-fastboot flash vendor_boot /tmp/dash-UNTESTED-vendor_boot.img
-fastboot reboot
-```
+当 CI 构建成功后，需要以下步骤得到最终可刷写的 `vendor_boot.img`：
 
-刷前备份原厂 vendor_boot。dash 是 VAB 结构，`vendor_boot` 分槽位，刷前确认活动槽。
+1. **CI 产物** → 一个 `vendor_boot.img`（fragment 0 为空，fragment 1 为自包含 recovery）
+
+2. **提取 CI recovery fragment**：
+   ```bash
+   python3 -c "
+   import struct
+   def align(v,a): return (v+a-1)//a*a
+   ci=open('vendor_boot.img','rb').read()
+   _,_,_,ec,es,_=struct.unpack_from('<IIII',ci,2112)
+   ro=align(struct.unpack_from('<I',ci,28)[0],4096)
+   tblo=align(align(ro+struct.unpack_from('<I',ci,24)[0],4096)+...,4096)
+   eo=tblo+1*es
+   sz,off,_=struct.unpack_from('<III',ci,eo)
+   open('ci-recovery.lz4','wb').write(ci[ro+off:ro+off+sz])
+   "
+   ```
+
+3. **从 rc1 模板解压 vendor ramdisk** 并应用 rc1 风格修改：
+   - 删除原厂 `system/bin/recovery`（TWRP 替代）
+   - 删除 `res/`（MIUI 恢复 UI，TWRP 不需要）
+   - 添加 `system/lib64/twrp16/`（rc1 的 9 个 compat libs）
+   - 修改 `system/etc/init/hw/init.rc`：
+     ```
+     service recovery /system/bin/recovery
+         socket recovery stream 422 system system
+         seclabel u:r:recovery:s0
+         user root
+         setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64
+     ```
+
+4. **制作 CJK recovery ramdisk**（以 rc1 recovery 为基）：
+   - 替换 `system/bin/recovery` 为 CI 构建的 recovery binary
+   - 添加 `twres/fonts/NotoSansCJKsc-Regular.ttf`（DroidSansFallback，3.6 MB）
+   - 添加 CI 构建中的全部 23 个 `twres/languages/*.xml`
+   - **保留** `system/lib64/stock-vendor-hal/`（keymint/gatekeeper/weaver 服务依赖此目录）
+   - 删除 `system/bin/fastbootd`（vendor 已提供）
+   - 然后用 LZ4 压缩：
+     ```bash
+     find . | cpio -o -H newc > /tmp/twrp.cpio
+     lz4 -l -9 /tmp/twrp.cpio /tmp/twrp-cjk.lz4
+     ```
+
+5. **重打包为最终 vendor_boot**：
+   ```bash
+   python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
+       --template dash-twrp16-v1.0.0-rc1-vendor_boot.img \
+       --fragment twrp-cjk.lz4 \
+       --output dash-CJK-vendor_boot.img
+   ```
+
+   **或** 手动打包：
+   ```bash
+   python3 tools/repack_vendor_boot.py \
+       --template /path/to/dash-twrp16-v1.0.0-rc1-vendor_boot.img \
+       --fragment /tmp/twrp-cjk.lz4 \
+       --output /tmp/dash-CJK-vendor_boot.img
+   ```
+
+### 最终镜像结构
+
+| 片段 | 内容 | 典型大小 |
+|------|------|----------|
+| Fragment 0 | **vendor ramdisk**（rc1 风格：删原厂 recovery + res/ + 加 twrp16/ + init.rc setenv） | ~34 MB |
+| Fragment 1 | **TWRP recovery**（rc1 基 + CI binary + CJK 字体 + 23 语言 + stock-vendor-hal） | ~19 MB |
+| **总计** | | **~53–55 MB / 64 MB**（余量 ~9–11 MB）|
+
+### 关键注意事项
+
+- **vendor ramdisk 的核心结构不能动**：`init`、`linker64`、`adbd`、`system/lib64/` 等 platform 组件必须保持原样，否则系统无法启动或进入 EDL
+- **`stock-vendor-hal/` 不能删**：虽然名字像 "NFC HAL"，但 keymint、gatekeeper、weaver 3 个服务的 `setenv LD_LIBRARY_PATH` 中都指向它；缺少此目录时 FBE 解密会失效
+- **`twrp16/` 的 LD_LIBRARY_PATH 必须放在 `service recovery` 内部**（而不是全局 `on boot`），否则影响其他服务的正常启动
+- **语言文件必须添加全部 23 个**（仅加 zh_CN/zh_TW 会导致 TWRP 语言切换按钮不出现）
+- **DroidSansFallback 字体（3.6 MB）** 是从另一版 dash TWRP 镜像中提取的已验证字体，覆盖 34,461 字形（含 20,902 CJK 汉字），是已知最小的高质量 CJK 中文字体
 
 ---
 
