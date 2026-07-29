@@ -96,5 +96,5 @@ TW_DEVICE_VERSION := lakitu
 
 # Include extra language packs (Chinese, Japanese, Korean, etc.)
 TW_EXTRA_LANGUAGES := true
-# Default UI language: Simplified Chinese
-TW_DEFAULT_LANGUAGE := zh_CN
+# Default UI language: English (extra languages still available in Settings)
+# TW_DEFAULT_LANGUAGE := zh_CN  # uncomment for Chinese as default
