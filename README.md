@@ -8,33 +8,54 @@ dash 的 recovery 内嵌在 `vendor_boot` 分区中（VAB 架构），Android �
 
 ---
 
-## 快速构建（GitHub Actions CI）
+## 本地构建
 
-使用 [TWRP-Recovery-Builder-2024](https://github.com/lakitu12/TWRP-Recovery-Builder-2024) 云端编译：
+### 同步源码
 
 ```bash
-gh workflow run TWRP-Recovery-Builder.yml --repo lakitu12/TWRP-Recovery-Builder-2024 \
-  -f MANIFEST_BRANCH=twrp-16.0 \
-  -f DEVICE_TREE=https://github.com/lakitu12/device_xiaomi_dash_twrp \
-  -f DEVICE_TREE_BRANCH=twrp-16.0 \
-  -f DEVICE_PATH=device/xiaomi/dash \
-  -f DEVICE_NAME=dash \
-  -f BUILD_TARGET=vendorboot \
-  -f LDCHECK="system/bin/recovery"
+mkdir source-twrp16 && cd source-twrp16
+repo init -u https://github.com/TWRP-Test/platform_manifest_twrp_aosp -b twrp-16.0
+mkdir -p .repo/local_manifests
+curl -L -o .repo/local_manifests/dash.xml \
+    https://raw.githubusercontent.com/lakitu12/device_xiaomi_dash_twrp/twrp-16.0/local_manifest.xml
+repo sync -j4 --force-sync
 ```
 
-CI 产出 recovery fragment（LZ4 cpio），需要本地重打包为完整 vendor_boot。
+### 编译
+
+```bash
+source build/envsetup.sh
+lunch twrp_dash-bp2a-eng
+SOONG_GOMEMLIMIT=8GiB SOONG_GOGC=20 m recovery vendorbootimage -j4
+```
+
+编译产物：
+- `out/target/product/dash/recovery/root/` — recovery ramdisk 文件系统
+- `out/target/product/dash/obj/PACKAGING/vendor_boot_intermediates/vendor_ramdisk.cpio.gz` — vendor ramdisk（仅含 TWRP 文件，不含内核模块，不可直接刷入）
+
+### 提取 recovery fragment
+
+```bash
+cd out/target/product/dash/obj/PACKAGING/vendor_boot_intermediates/
+# vendor ramdisk 是 gzip 压缩的 cpio，解压后提取 recovery 相关内容
+# 或者从 recovery/root/ 手动打包
+cd out/target/product/dash/recovery/root
+find . | cpio -o -H newc > /tmp/twrp.cpio
+lz4 -l -12 --favor-decSpeed /tmp/twrp.cpio /tmp/twrp-fragment.lz4
+```
+
+---
 
 ## 重打包
 
-CI 只编译了 recovery binary，vendor ramdisk 必须用 rc1 模板（含 `system/lib64/twrp16/` 兼容库目录）。
+CI 只编译了 recovery binary，vendor ramdisk 必须用 **rc1 模板**（含 `system/lib64/twrp16/` 兼容库目录）。
 
 ### 工具
 
 ```bash
 python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
     --template dash-twrp16-v1.0.0-rc1-vendor_boot.img \
-    --fragment recovery-only-fragment.lz4 \
+    --fragment twrp-fragment.lz4 \
     --output /tmp/dash-FINAL.img
 ```
 
@@ -43,7 +64,7 @@ python3 device/xiaomi/dash/tools/repack_vendor_boot.py \
 | 参数 | 说明 |
 |------|------|
 | `--template` | rc1 模板 vendor_boot（提供含 `twrp16/` 库的 vendor ramdisk） |
-| `--fragment` | CI 产出的新 recovery fragment（LZ4 压缩的 cpio） |
+| `--fragment` | 新 recovery fragment（LZ4 压缩的 cpio） |
 | `--output` | 输出路径，默认 `/tmp/dash-FINAL.img` |
 
 脚本工作原理：解析 v4 header，保留 fragment 0（vendor ramdisk），替换 fragment 1（recovery），填充到 64MB 分区大小，拷贝 AVB footer。
