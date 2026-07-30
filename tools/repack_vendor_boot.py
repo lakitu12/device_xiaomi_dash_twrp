@@ -151,11 +151,22 @@ def main():
             if os.path.isfile(os.path.join(f'{f0d}/system/lib64', f)):
                 f0_libs.add(f)
     
-    # 删除 F0 已提供的系统库
+    # 删除 F0 已提供的系统库（但保留 services 需要的 API 36 系统库）
+    # 这 5 个系统库 + HAL 库由 init 启动的服务使用，不走 LD_LIBRARY_PATH
+    system_keep = {'libbinder.so','libc.so','libhidlbase.so','libzstd.so',
+                   'libboot_control_client.so'}
+    # 保留所有 android.hardware.* HAL 库（system services 需要 API 36 版）
+    if os.path.isdir(f'{f1d}/system/lib64'):
+        # Add all android.hardware.* libs to keep list
+        for f in os.listdir(f'{f1d}/system/lib64'):
+            if f.startswith('android.') or f.startswith('libandroid.'):
+                system_keep.add(f)
+    
     if os.path.isdir(f'{f1d}/system/lib64'):
         dedup = 0
         for f in list(os.listdir(f'{f1d}/system/lib64')):
             if f == 'twrp16': continue
+            if f in system_keep: continue
             if f in f0_libs:
                 os.remove(os.path.join(f'{f1d}/system/lib64', f))
                 dedup += 1
