@@ -134,88 +134,73 @@ def main():
     f0 = open('/tmp/_f0.lz4', 'rb').read()
     print(f"  F0: {len(f0)/1024/1024:.2f} MB")
 
-    # === F1: 使用 CI F1，按需裁剪 ===
-    # 如果 CI F1 是自包含模式（>100 个库），做后处理：
-    #   1. 去重 F0 已有的系统库（F0 + twrp16/ 提供）
-    #   2. 删除 CI 多余的 keystore2 生态库
-    # 如果 CI F1 已经是正确模式（约 84 库），直接使用
-    f1 = ci_frags[1]
+    # === F1: 裁剪 CI F1 ===
+    # 1. 去重 F0 已有的系统库（F0 + twrp16/ 提供）
+    # 2. 删除 CI 多余的 keystore2 生态库
+    print(f"\n[F1] 裁剪 CI F1 ...")
+    f1d = '/tmp/_f1_trim'
+    if os.path.exists(f1d): shutil.rmtree(f1d)
+    os.makedirs(f1d)
+    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin'], input=ci_frags[1], capture_output=True)
+    subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True, cwd=f1d)
     
-    # 检查 CI F1 的库数
-    ci_f1_libs = 0
-    if os.path.isdir(f'{ci_f1d}/system/lib64'):
-        ci_f1_libs = len([f for f in os.listdir(f'{ci_f1d}/system/lib64') if f.endswith('.so')])
+    # 收集 F0 的库列表
+    f0_libs = set()
+    if os.path.isdir(f'{f0d}/system/lib64'):
+        for f in os.listdir(f'{f0d}/system/lib64'):
+            if os.path.isfile(os.path.join(f'{f0d}/system/lib64', f)):
+                f0_libs.add(f)
     
-    if ci_f1_libs > 100:
-        print(f"\n[F1] CI 是自包含模式 ({ci_f1_libs} 库)，开始裁剪 ...")
-        # 解压 CI F1 到工作目录
-        f1d = '/tmp/_f1_trim'
-        if os.path.exists(f1d): shutil.rmtree(f1d)
-        os.makedirs(f1d)
-        r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin'], input=ci_frags[1], capture_output=True)
-        subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True, cwd=f1d)
-        
-        # 收集 F0 的库列表
-        f0_libs = set()
-        if os.path.isdir(f'{f0d}/system/lib64'):
-            for f in os.listdir(f'{f0d}/system/lib64'):
-                if os.path.isfile(os.path.join(f'{f0d}/system/lib64', f)):
-                    f0_libs.add(f)
-        
-        # 删除 F0 已提供的系统库
-        if os.path.isdir(f'{f1d}/system/lib64'):
-            dedup = 0
-            for f in list(os.listdir(f'{f1d}/system/lib64')):
-                if f == 'twrp16': continue
-                if f in f0_libs:
-                    os.remove(os.path.join(f'{f1d}/system/lib64', f))
-                    dedup += 1
-            print(f"  去重: 删除 {dedup} 个 F0 已有系统库")
-        
-        # 删除 CI 多余的 keystore2 生态库
-        ks_remove = [
-            'libkeystore2_aaid.so','libkeystore2_apc_compat.so','libkeystore2_crypto.so',
-            'libkeystore-attestation-application-id.so','libkm_compat.so','libkm_compat_service.so',
-            'libservices.so','server_configurable_flags.so',
-            'libcppbor.so','libcppbor_external.so','libcppcose_rkp.so',
-            'libnos_datagram.so','libnos_transport.so',
-            'libperfetto_c.so','libxml2.so','libincfs.so',
-            'libaconfig_storage_read_api_cc.so','libutilscallstack.so',
-            'libhardware_legacy.so','libhwbinder.so',
-            'libpuresoftkeymasterdevice.so','libsoftkeymasterdevice.so',
-            'libsoft_attestation_cert.so',
-            'libkeymaster4_1support.so','libkeymaster4support.so','libkeymaster_portable.so',
-            'android.frameworks.stats-V1-ndk.so',
-            'android.hardware.confirmationui-V1-ndk.so','android.hardware.confirmationui@1.0.so',
-            'android.hardware.security.rkp-V3-ndk.so','android.hardware.security.sharedsecret-V1-ndk.so',
-            'android.hardware.vibrator-V1-cpp.so','android.hardware.vibrator-V1-ndk.so',
-            'android.hardware.vibrator-V2-cpp.so','android.hardware.vibrator-V2-ndk.so',
-            'android.hardware.vibrator@1.0.so','android.hardware.vibrator@1.1.so',
-            'android.hardware.vibrator@1.2.so',
-            'android.security.aaid_aidl-cpp.so','android.security.apc-ndk.so',
-            'android.security.authorization-ndk.so','android.security.compat-ndk.so',
-            'android.system.keystore2-V3-ndk.so','android.system.keystore2-V5-ndk.so',
-            'android.system.suspend-V1-ndk.so','android.system.suspend@1.0.so',
-            'android.system.wifi.keystore@1.0.so',
-            'android.hardware.health.storage-V1-ndk.so','android.hardware.health.storage@1.0.so',
-        ]
-        if os.path.isdir(f'{f1d}/system/lib64'):
-            ks_del = 0
-            for f in list(os.listdir(f'{f1d}/system/lib64')):
-                if f in ks_remove:
-                    os.remove(os.path.join(f'{f1d}/system/lib64', f))
-                    ks_del += 1
-            print(f"  清理: 删除 {ks_del} 个 CI 多余生态库")
-        
-        # 重新打包 F1
-        r = subprocess.run(['find', '.', '-print0'], capture_output=True, cwd=f1d)
-        p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'], input=r.stdout, capture_output=True, cwd=f1d)
-        subprocess.run(['lz4', '-l', '-9', '--force', '-', '/tmp/_f1_trimmed.lz4'], input=p.stdout, capture_output=True)
-        f1 = open('/tmp/_f1_trimmed.lz4', 'rb').read()
-        print(f"  裁剪后 F1: {len(f1)/1024/1024:.2f} MB")
-    else:
-        print(f"\n[F1] CI F1 已是正确模式 ({ci_f1_libs} 库)，直接使用")
+    # 删除 F0 已提供的系统库
+    if os.path.isdir(f'{f1d}/system/lib64'):
+        dedup = 0
+        for f in list(os.listdir(f'{f1d}/system/lib64')):
+            if f == 'twrp16': continue
+            if f in f0_libs:
+                os.remove(os.path.join(f'{f1d}/system/lib64', f))
+                dedup += 1
+        print(f"  去重: 删除 {dedup} 个 F0 已有系统库")
     
+    # 删除 CI 多余的 keystore2 生态库
+    ks_remove = [
+        'libkeystore2_aaid.so','libkeystore2_apc_compat.so','libkeystore2_crypto.so',
+        'libkeystore-attestation-application-id.so','libkm_compat.so','libkm_compat_service.so',
+        'libservices.so','server_configurable_flags.so',
+        'libcppbor.so','libcppbor_external.so','libcppcose_rkp.so',
+        'libnos_datagram.so','libnos_transport.so',
+        'libperfetto_c.so','libxml2.so','libincfs.so',
+        'libaconfig_storage_read_api_cc.so','libutilscallstack.so',
+        'libhardware_legacy.so','libhwbinder.so',
+        'libpuresoftkeymasterdevice.so','libsoftkeymasterdevice.so',
+        'libsoft_attestation_cert.so',
+        'libkeymaster4_1support.so','libkeymaster4support.so','libkeymaster_portable.so',
+        'android.frameworks.stats-V1-ndk.so',
+        'android.hardware.confirmationui-V1-ndk.so','android.hardware.confirmationui@1.0.so',
+        'android.hardware.security.rkp-V3-ndk.so','android.hardware.security.sharedsecret-V1-ndk.so',
+        'android.hardware.vibrator-V1-cpp.so','android.hardware.vibrator-V1-ndk.so',
+        'android.hardware.vibrator-V2-cpp.so','android.hardware.vibrator-V2-ndk.so',
+        'android.hardware.vibrator@1.0.so','android.hardware.vibrator@1.1.so',
+        'android.hardware.vibrator@1.2.so',
+        'android.security.aaid_aidl-cpp.so','android.security.apc-ndk.so',
+        'android.security.authorization-ndk.so','android.security.compat-ndk.so',
+        'android.system.keystore2-V3-ndk.so','android.system.keystore2-V5-ndk.so',
+        'android.system.suspend-V1-ndk.so','android.system.suspend@1.0.so',
+        'android.system.wifi.keystore@1.0.so',
+        'android.hardware.health.storage-V1-ndk.so','android.hardware.health.storage@1.0.so',
+    ]
+    if os.path.isdir(f'{f1d}/system/lib64'):
+        ks_del = 0
+        for f in list(os.listdir(f'{f1d}/system/lib64')):
+            if f in ks_remove:
+                os.remove(os.path.join(f'{f1d}/system/lib64', f))
+                ks_del += 1
+        print(f"  清理: 删除 {ks_del} 个 CI 多余生态库")
+    
+    # 重新打包 F1
+    r = subprocess.run(['find', '.', '-print0'], capture_output=True, cwd=f1d)
+    p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'], input=r.stdout, capture_output=True, cwd=f1d)
+    subprocess.run(['lz4', '-l', '-9', '--force', '-', '/tmp/_f1_trimmed.lz4'], input=p.stdout, capture_output=True)
+    f1 = open('/tmp/_f1_trimmed.lz4', 'rb').read()
     print(f"  F1: {len(f1)/1024/1024:.2f} MB")
 
     # === 构建 vendor_boot ===
