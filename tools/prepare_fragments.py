@@ -1,148 +1,220 @@
 #!/usr/bin/env python3
 """
-准备 F0+F1 碎片清单，供 stock_aware_repack_tool --replacement-manifest 使用。
+准备 vendor_boot fragment 的 LZ4 压缩包和 manifest。
+
+输出三个文件：
+  <prefix>.f0.lz4       — 改造后的 F0 fragment (stock + twrp16 + setenv)
+  <prefix>.f1.lz4       — 改造后的 F1 fragment (validated F1 + staging overlay + RC)
+  <prefix>.manifest.json — stock_aware_repack_tool 的 --replacement-manifest
 
 用法：
-  python3 prepare_fragments.py \
-    --stock /tmp/stock_vendor_boot.img \
-    --ci workspace/out/target/product/dash/vendor_boot.img \
-    --validated /tmp/validated_vendor_boot.img \
-    --staging workspace/out/target/product/dash/recovery/root \
-    --dtroot device/xiaomi/dash \
+  python3 tools/prepare_fragments.py \
+    --stock stock.img \
+    --ci ci.img \
+    --validated validated.img \
+    --staging out/target/product/dash/recovery/root \
+    --dtroot /path/to/device/tree \
     --prefix /tmp/fragments
+
+然后用 stock_aware_repack_tool 重打包：
+  repack/stock_aware_repack_tool \
+    --template stock.img \
+    --vbmeta-owner vbmeta.img \
+    --replacement-manifest /tmp/fragments.manifest.json \
+    --output final.img \
+    --report report.json \
+    --budget-output budget.json
 """
-import argparse, json, os, subprocess, sys, shutil, struct, hashlib
+
+import struct, subprocess, os, shutil, sys, argparse, tempfile, json
 
 PAGE_SIZE = 4096
-PART_SZ = 67108864
+
+TWRP16_LIBS = [
+    'libbase.so', 'libbootloader_message.so', 'libc++.so', 'libcutils.so',
+    'libfs_mgr.so', 'liblog.so', 'liblp.so', 'libprotobuf-cpp-lite.so', 'libutils.so',
+]
+
+DT_OVERLAY_RCS = ['init.recovery.mt6991.rc', 'init.recovery.project.rc']
+
+STAGING_OVERLAY_FILES = [
+    'system/bin/recovery',
+    'system/etc/recovery.fstab',
+    'twres/languages/en.xml',
+]
+
 
 def align(v, a):
     return (v + a - 1) // a * a
 
-def parse_vendor_boot(path):
-    """解析 vendor_boot v4 镜像，返回字段和碎片列表"""
+def parse(path):
     d = open(path, 'rb').read()
-    hs, ds = struct.unpack_from('<II', d, 2096)
-    _, ec, es, _ = struct.unpack_from('<IIII', d, 2112)
+    hs = struct.unpack_from('<I', d, 2096)[0]
+    ds = struct.unpack_from('<I', d, 2100)[0]
     rs = struct.unpack_from('<I', d, 24)[0]
     ro = align(hs, PAGE_SIZE)
     dtbo = align(ro + rs, PAGE_SIZE)
     tblo = align(dtbo + align(ds, PAGE_SIZE), PAGE_SIZE)
+    ec = struct.unpack_from('<I', d, 2116)[0]
+    es = struct.unpack_from('<I', d, 2120)[0]
     frags = []
     for i in range(ec):
         eo = tblo + i * es
-        if eo + 12 > len(d):
-            break
         sz, off, typ = struct.unpack_from('<III', d, eo)
-        name = d[eo+12:eo+44].rstrip(b'\x00').decode('utf-8', errors='ignore')
-        payload = d[ro+off:ro+off+sz] if sz > 0 and ro+off+sz <= len(d) else b''
-        frags.append({
-            'idx': i + 1,
-            'sz': sz, 'off': off, 'typ': typ, 'name': name,
-            'payload': payload,
-        })
-    return {
-        'raw': d, 'p0': d[:PAGE_SIZE], 'hs': hs, 'ds': ds, 'rs': rs,
-        'ro': ro, 'dtbo': dtbo, 'tblo': tblo, 'ec': ec, 'es': es, 'frags': frags,
-    }
+        frags.append(d[ro + off:ro + off + sz])
+    return frags
 
-def lz4_decompress(data, dest):
-    """解压 LZ4 到目录"""
-    if os.path.exists(dest):
-        shutil.rmtree(dest)
-    os.makedirs(dest)
-    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin', '--favor-decSpeed'],
-                       input=data, capture_output=True, timeout=60)
-    if r.returncode != 0:
-        raise RuntimeError(f"lz4 decompress failed: {r.stderr.decode()}")
-    r2 = subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True, timeout=60, cwd=dest)
-    if r2.returncode != 0:
-        raise RuntimeError(f"cpio extract failed: {r2.stderr.decode()}")
-
-def lz4_compress(src_dir, out_path):
-    """压缩目录为 LZ4 cpio"""
-    r = subprocess.run(['find', '.', '-print0'], capture_output=True, timeout=30, cwd=src_dir)
+def pack_cpio_lz4(src_dir):
+    """打包目录为 LZ4 legacy 格式的 CPIO fragment。"""
+    r = subprocess.run(['find', '.', '-print0'], capture_output=True, cwd=src_dir)
     p = subprocess.run(['cpio', '-o', '-H', 'newc', '--null'],
-                       input=r.stdout, capture_output=True, timeout=120, cwd=src_dir)
-    subprocess.run(['lz4', '-l', '-9', '--force', '-', out_path],
-                   input=p.stdout, capture_output=True, timeout=120)
-    return open(out_path, 'rb').read()
+                       input=r.stdout, capture_output=True, cwd=src_dir)
+    result = subprocess.run(['lz4', '-l', '-9', '--force', '-', '-'],
+                            input=p.stdout, capture_output=True)
+    return result.stdout
 
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(1024*1024), b''):
-            h.update(chunk)
-    return h.hexdigest()
+def decompress_fragment(frag_data, dest_dir):
+    if os.path.exists(dest_dir):
+        shutil.rmtree(dest_dir)
+    os.makedirs(dest_dir)
+    r = subprocess.run(['lz4', '-d', '-c', '/dev/stdin'], input=frag_data, capture_output=True)
+    subprocess.run(['cpio', '-idm'], input=r.stdout, capture_output=True, cwd=dest_dir)
+
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description='Prepare F0+F1 LZ4 fragments and manifest for stock_aware_repack_tool')
     ap.add_argument('--stock', required=True, help='原厂 vendor_boot.img')
-    ap.add_argument('--ci', required=True, help='CI 编译的 vendor_boot.img')
-    ap.add_argument('--validated', required=True, help='已验证可工作的 vendor_boot.img')
-    ap.add_argument('--staging', required=True, help='staging 目录 (recovery/root)')
-    ap.add_argument('--dtroot', required=True, help='device tree 根目录')
-    ap.add_argument('--prefix', required=True, help='输出前缀 (如 /tmp/fragments)')
+    ap.add_argument('--ci', required=True, help='CI 构建产物 vendor_boot.img（提取 twrp16 库）')
+    ap.add_argument('--validated', required=True, help='已验证可工作的 vendor_boot.img（提取 F1）')
+    ap.add_argument('--staging', default=None, help='可选：m recovery vendorbootimage 的 staging 目录')
+    ap.add_argument('--dtroot', default=None, help='设备树根目录（默认脚本上级目录）')
+    ap.add_argument('--prefix', default='/tmp/fragments', help='输出文件前缀')
     args = ap.parse_args()
 
-    print(f"Stock:  {args.stock}")
-    print(f"CI:     {args.ci}")
-    print(f"Valid:  {args.validated}")
-    print(f"Staging: {args.staging}")
-    print(f"Output:  {args.prefix}.lz4 / .manifest.json")
+    dtroot = args.dtroot
+    if dtroot is None:
+        dtroot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dt_rc_dir = os.path.join(dtroot, 'recovery/root')
 
-    # 解析三个镜像
-    stock = parse_vendor_boot(args.stock)
-    ci = parse_vendor_boot(args.ci)
-    validated = parse_vendor_boot(args.validated)
+    for p in [args.stock, args.ci, args.validated]:
+        if not os.path.exists(p):
+            print(f"ERROR: {p} not found", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"\nStock:  F0={len(stock['frags'][0]['payload'])/1024/1024:.2f}MB F1={len(stock['frags'][1]['payload'])/1024/1024:.2f}MB")
-    print(f"CI:     F0={len(ci['frags'][0]['payload'])/1024/1024:.2f}MB F1={len(ci['frags'][1]['payload'])/1024/1024:.2f}MB")
-    print(f"Valid:  F0={len(validated['frags'][0]['payload'])/1024/1024:.2f}MB F1={len(validated['frags'][1]['payload'])/1024/1024:.2f}MB")
+    tmpdir = tempfile.mkdtemp(prefix='frag_')
+    print(f"临时目录: {tmpdir}")
 
-    # F0: stock 的 F0 (page0 + dtb + vendor_ramdisk 碎片 0)
-    f0_lz4 = stock['frags'][0]['payload']
-    f0_path = args.prefix + '.F0.lz4'
-    open(f0_path, 'wb').write(f0_lz4)
-    f0_sha256 = sha256_file(f0_path)
-    print(f"F0: {len(f0_lz4)/1024/1024:.2f} MB, sha256={f0_sha256[:16]}...")
+    try:
+        stk_frags = parse(args.stock)
+        ci_frags = parse(args.ci)
+        val_frags = parse(args.validated)
 
-    # F1: validated 的 F1 (已验证可工作的 recovery ramdisk)
-    f1_lz4 = validated['frags'][1]['payload']
-    f1_path = args.prefix + '.F1.lz4'
-    open(f1_path, 'wb').write(f1_lz4)
-    f1_sha256 = sha256_file(f1_path)
-    print(f"F1: {len(f1_lz4)/1024/1024:.2f} MB, sha256={f1_sha256[:16]}...")
+        # === F0: validated F0 + twrp16 + setenv - recovery - res ===
+        print("[F0] 使用 validated vendor ramdisk 作为基础 ...")
+        f0d = os.path.join(tmpdir, '_f0')
+        decompress_fragment(val_frags[0], f0d)
 
-    # 验证 staging 目录存在
-    if not os.path.isdir(args.staging):
-        print(f"ERROR: staging dir not found: {args.staging}", file=sys.stderr)
-        sys.exit(1)
+        for p in [f'{f0d}/system/bin/recovery', f'{f0d}/res']:
+            if os.path.exists(p):
+                (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
+        print("  - recovery binary + res/")
 
-    # 生成 manifest.json 供 stock_aware_repack_tool --replacement-manifest 使用
-    manifest = {
-        'template': args.stock,
-        'vbmeta_owner': None,  # 工作流中单独提供
-        'replacements': [
-            {
-                'target_name': 'recovery',
-                'target_type': 2,
-                'replacement': f1_path,
-                'sha256': f1_sha256,
-                'original_size': len(f1_lz4),
-            },
-        ],
-        'metadata': {
-            'f0_sha256': f0_sha256,
-            'f1_sha256': f1_sha256,
-            'staging': args.staging,
-            'dtroot': args.dtroot,
+        ci_f1d = os.path.join(tmpdir, '_ci_f1')
+        decompress_fragment(ci_frags[1], ci_f1d)
+
+        td = f'{f0d}/system/lib64/twrp16'
+        os.makedirs(td, exist_ok=True)
+        copied = 0
+        for lib in TWRP16_LIBS:
+            s = os.path.join(ci_f1d, 'system/lib64', lib)
+            if os.path.exists(s):
+                shutil.copy2(s, f'{td}/{lib}', follow_symlinks=False)
+                copied += 1
+        print(f"  + twrp16/ ({copied} libs)")
+
+        irc = f'{f0d}/system/etc/init/hw/init.rc'
+        if os.path.exists(irc):
+            c = open(irc).read()
+            old = '    seclabel u:r:recovery:s0\n    user root\n'
+            setenv_line = '    setenv LD_LIBRARY_PATH /system/lib64/twrp16:/system/lib64\n'
+            if old in c and setenv_line.strip() not in c:
+                c = c.replace(old, old + setenv_line)
+            open(irc, 'w').write(c)
+            print("  + setenv in init.rc")
+
+        f0_lz4 = pack_cpio_lz4(f0d)
+        print(f"  F0: {len(f0_lz4)/1024/1024:.2f} MB")
+
+        # === F1: validated F1 + staging overlay + device tree RC ===
+        print(f"\n[F1] 使用 validated runtime tree ...")
+        val_f1d = os.path.join(tmpdir, '_val_f1')
+        decompress_fragment(val_frags[1], val_f1d)
+
+        f1d = os.path.join(tmpdir, '_new_f1')
+        if os.path.exists(f1d): shutil.rmtree(f1d)
+        shutil.copytree(val_f1d, f1d, symlinks=True)
+        print(f"  F1: copied from validated tree")
+
+        if args.staging:
+            print(f"  [staging] 从 {args.staging} 覆盖审计文件 ...")
+            for rel in STAGING_OVERLAY_FILES:
+                src = os.path.join(args.staging, rel)
+                if os.path.exists(src):
+                    dst = os.path.join(f1d, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst, follow_symlinks=False)
+                    print(f"    + {rel}")
+                else:
+                    print(f"    ! {rel} not in staging (skip)")
+
+        for rc_name in DT_OVERLAY_RCS:
+            dt_path = os.path.join(dt_rc_dir, rc_name)
+            if os.path.exists(dt_path):
+                shutil.copy2(dt_path, os.path.join(f1d, rc_name))
+                print(f"  + overlay {rc_name}")
+
+        f1_lz4 = pack_cpio_lz4(f1d)
+        print(f"  F1: {len(f1_lz4)/1024/1024:.2f} MB")
+
+        # === 输出文件 ===
+        f0_path = f'{args.prefix}.f0.lz4'
+        f1_path = f'{args.prefix}.f1.lz4'
+        manifest_path = f'{args.prefix}.manifest.json'
+
+        for p in [f0_path, f1_path]:
+            if os.path.exists(p):
+                os.remove(p)
+
+        with open(f0_path, 'wb') as f:
+            f.write(f0_lz4)
+        with open(f1_path, 'wb') as f:
+            f.write(f1_lz4)
+
+        manifest = {
+            "replacements": [
+                {"name": "", "type": 1, "path": os.path.abspath(f0_path)},
+                {"name": "recovery", "type": 2, "path": os.path.abspath(f1_path)},
+            ]
         }
-    }
-    manifest_path = args.prefix + '.manifest.json'
-    json.dump(manifest, open(manifest_path, 'w'), indent=2)
-    print(f"\nManifest written: {manifest_path}")
-    print("Done.")
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2)
+
+        print(f"\n输出:")
+        print(f"  F0 fragment: {f0_path} ({len(f0_lz4)/1024/1024:.2f} MB)")
+        print(f"  F1 fragment: {f1_path} ({len(f1_lz4)/1024/1024:.2f} MB)")
+        print(f"  Manifest:    {manifest_path}")
+        print(f"\n用 stock_aware_repack_tool 重打包:")
+        print(f"  repack/stock_aware_repack_tool \\")
+        print(f"    --template <stock_vendor_boot.img> \\")
+        print(f"    --vbmeta-owner <stock_vbmeta.img> \\")
+        print(f"    --replacement-manifest {manifest_path} \\")
+        print(f"    --output <final.img> \\")
+        print(f"    --report report.json \\")
+        print(f"    --budget-output budget.json")
+        print("完成!")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 if __name__ == '__main__':
     main()
