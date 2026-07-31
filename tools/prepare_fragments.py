@@ -109,10 +109,10 @@ def main():
         ci_frags = parse(args.ci)
         val_frags = parse(args.validated)
 
-        # === F0: validated F0 + twrp16 + setenv - recovery - res ===
-        print("[F0] 使用 validated vendor ramdisk 作为基础 ...")
+        # === F0: stock + twrp16 + setenv - recovery - res ===
+        print("[F0] 改造 stock vendor ramdisk ...")
         f0d = os.path.join(tmpdir, '_f0')
-        decompress_fragment(val_frags[0], f0d)
+        decompress_fragment(stk_frags[0], f0d)
 
         for p in [f'{f0d}/system/bin/recovery', f'{f0d}/res']:
             if os.path.exists(p):
