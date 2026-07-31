@@ -119,14 +119,15 @@ def main():
                 (shutil.rmtree if os.path.isdir(p) else os.remove)(p)
         print("  - recovery binary + res/")
 
-        ci_f1d = os.path.join(tmpdir, '_ci_f1')
-        decompress_fragment(ci_frags[1], ci_f1d)
+        # twrp16 libs 来自 CI 的 F0 (vendor ramdisk, fragment 0)，不是 F1
+        ci_f0d = os.path.join(tmpdir, '_ci_f0')
+        decompress_fragment(ci_frags[0], ci_f0d)
 
         td = f'{f0d}/system/lib64/twrp16'
         os.makedirs(td, exist_ok=True)
         copied = 0
         for lib in TWRP16_LIBS:
-            s = os.path.join(ci_f1d, 'system/lib64', lib)
+            s = os.path.join(ci_f0d, 'system/lib64', lib)
             if os.path.exists(s):
                 shutil.copy2(s, f'{td}/{lib}', follow_symlinks=False)
                 copied += 1
